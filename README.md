@@ -1,4 +1,11 @@
-# PurpleInsight — Trusted Conversational Intelligence for NatWest
+# PurpleInsight - Trusted Conversational Intelligence for NatWest
+<p align="center">
+    <picture>
+        <img src="https://github.com/user-attachments/assets/544c9e57-a67c-4ec3-8f95-1f6478e4fb62" 
+             alt="Project Image" 
+             width="700">
+    </picture>
+</p>
 
 > *"Every answer must be explainable, auditable, and traceable — because in banking, trust isn't optional."*
 
