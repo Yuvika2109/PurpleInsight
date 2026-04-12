@@ -89,7 +89,7 @@ All other variables have working defaults and do not need to be changed.
 ### Step 5 — Run the Streamlit UI
 
 ```bash
-streamlit run src/ui/app.py
+PYTHONPATH=. ./venv/bin/streamlit run src/ui/app.py
 ```
 
 The app opens at **http://localhost:8501**
