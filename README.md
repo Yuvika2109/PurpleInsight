@@ -118,7 +118,7 @@ pytest tests/ -v
 | UI | Streamlit |
 | API | FastAPI + Uvicorn |
 | Analytics engine | DuckDB (in-memory SQL) |
-| LLM — SQL generation | Groq (llama3-70b-8192) with local fallback |
+| LLM — SQL generation | Groq (llama3-8b-8192) with local fallback |
 | LLM — narrative | Groq with local fallback |
 | Intent classification | Keyword matching + Sentence Transformers (all-MiniLM-L6-v2) |
 | Charts | Plotly |
