@@ -77,3 +77,12 @@ xxhash==3.6.0
 yarl==1.23.0
 zstandard==0.25.0
 pandas==2.0.3
+duckdb
+fastapi
+groq
+loguru
+plotly
+python-dateutil
+scikit-learn
+sentence-transformers
+streamlit

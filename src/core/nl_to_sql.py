@@ -2,49 +2,48 @@
 nl_to_sql.py
 ------------
 Converts natural language queries into valid DuckDB SQL statements
-using Google Gemini 1.5 Flash (free tier).
+using Groq + Llama 3.1 70B (free tier, fastest inference available).
 
 Key features:
     - Injects metric definitions from metrics.yaml into every prompt
-      so the LLM always uses canonical NatWest definitions
     - Use-case-specific prompt templates per the 4 NatWest use cases
     - SQL validation before returning — rejects unsafe or invalid SQL
     - Never exposes raw PII or sensitive row-level data in queries
 
 Security:
-    - Only SELECT statements are allowed (no INSERT/UPDATE/DELETE/DROP)
-    - All queries run against pre-loaded DuckDB views (not raw files)
+    - Only SELECT statements are allowed
     - Row-level data is never surfaced — only aggregations
 """
 
 import os
 import re
-from urllib import response
 import yaml
 from loguru import logger
 from dotenv import load_dotenv
-from google import genai
+from groq import Groq
 
+from config.dataset_registry import build_schema_prompt_block, get_dataset_profile, list_registered_datasets
 from src.core.intent_router import UseCase
 
 load_dotenv()
 
-# ── Gemini setup ──────────────────────────────────────────────────────────────
-_CLIENT = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# ── Groq client ───────────────────────────────────────────────────────────────
+_CLIENT = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_MODEL  = "llama-3.1-70b-versatile"
 
-# ── Dataset schemas — what DuckDB can query ───────────────────────────────────
+# ── Dataset schemas ───────────────────────────────────────────────────────────
 DATASET_SCHEMAS = {
     "regional_revenue": """
         Table: regional_revenue
         Columns:
-            month           TEXT        -- format: YYYY-MM (e.g. '2024-02')
-            region          TEXT        -- one of: North, South, East, West, Scotland, Wales
-            product         TEXT        -- one of: Personal Current Account, Savings Account, Mortgage, Credit Card, Business Loan
-            channel         TEXT        -- one of: Branch, Mobile App, Online, Telephone
-            revenue         FLOAT       -- revenue in GBP
-            transactions    INTEGER     -- number of transactions
-            avg_ticket      FLOAT       -- average transaction value in GBP
-            ad_spend        FLOAT       -- advertising spend in GBP
+            month           TEXT    -- format: YYYY-MM (e.g. '2024-02')
+            region          TEXT    -- one of: North, South, East, West, Scotland, Wales
+            product         TEXT    -- one of: Personal Current Account, Savings Account, Mortgage, Credit Card, Business Loan
+            channel         TEXT    -- one of: Branch, Mobile App, Online, Telephone
+            revenue         FLOAT   -- revenue in GBP
+            transactions    INTEGER -- number of transactions
+            avg_ticket      FLOAT   -- average transaction value in GBP
+            ad_spend        FLOAT   -- advertising spend in GBP
     """,
     "customer_metrics": """
         Table: customer_metrics
@@ -52,28 +51,28 @@ DATASET_SCHEMAS = {
             month               TEXT    -- format: YYYY-MM
             segment             TEXT    -- one of: Retail, Business, Premier, Student
             region              TEXT    -- one of: North, South, East, West, Scotland, Wales
-            new_signups         INTEGER -- new customers in period
-            churned             INTEGER -- customers who left
-            churn_rate_pct      FLOAT   -- churn as percentage (e.g. 1.8 = 1.8%)
-            complaints          INTEGER -- number of formal complaints
-            nps_score           INTEGER -- Net Promoter Score (0-100)
-            avg_handle_time     INTEGER -- average call handle time in seconds
-            active_customers    INTEGER -- total active customers
+            new_signups         INTEGER
+            churned             INTEGER
+            churn_rate_pct      FLOAT   -- e.g. 1.8 means 1.8%
+            complaints          INTEGER
+            nps_score           INTEGER -- 0 to 100
+            avg_handle_time     INTEGER -- seconds
+            active_customers    INTEGER
     """,
     "product_performance": """
         Table: product_performance
         Columns:
-            week                TEXT    -- format: YYYY-WNN (e.g. '2024-W05')
+            week                TEXT    -- format: YYYY-WNN
             week_start_date     TEXT    -- format: YYYY-MM-DD
             product             TEXT    -- one of: Personal Current Account, Savings Account, Mortgage, Credit Card, Business Loan
             region              TEXT    -- one of: North, South, East, West, Scotland, Wales
-            transaction_volume  INTEGER -- number of transactions
-            revenue             FLOAT   -- revenue in GBP
-            new_customers       INTEGER -- new customers for this product
-            return_customers    INTEGER -- returning customers
-            return_rate_pct     FLOAT   -- return customer rate as percentage
-            conversion_rate_pct FLOAT   -- conversion rate as percentage
-            satisfaction_score  FLOAT   -- satisfaction score (1.0-5.0)
+            transaction_volume  INTEGER
+            revenue             FLOAT
+            new_customers       INTEGER
+            return_customers    INTEGER
+            return_rate_pct     FLOAT
+            conversion_rate_pct FLOAT
+            satisfaction_score  FLOAT   -- 1.0 to 5.0
     """,
     "cost_breakdown": """
         Table: cost_breakdown
@@ -81,398 +80,444 @@ DATASET_SCHEMAS = {
             quarter         TEXT    -- format: QN-YYYY (e.g. 'Q1-2024')
             department      TEXT    -- one of: Technology, Operations, Risk & Compliance, Marketing, Customer Service, Finance
             cost_category   TEXT    -- one of: Headcount, Infrastructure, Software Licences, Marketing Spend, Training, Outsourcing
-            cost_gbp        FLOAT   -- actual cost in GBP
-            headcount       INTEGER -- number of FTE employees
-            budget_gbp      FLOAT   -- approved budget in GBP
-            variance_pct    FLOAT   -- budget variance percentage
+            cost_gbp        FLOAT
+            headcount       INTEGER
+            budget_gbp      FLOAT
+            variance_pct    FLOAT
     """,
     "weekly_kpis": """
         Table: weekly_kpis
         Columns:
             week                        TEXT    -- format: YYYY-WNN
             week_start_date             TEXT    -- format: YYYY-MM-DD
-            new_signups                 INTEGER -- new customers this week
-            wow_signup_change_pct       FLOAT   -- week-over-week signup change %
-            churn_rate_pct              FLOAT   -- weekly churn rate %
-            total_active_customers      INTEGER -- total active customers
-            complaints                  INTEGER -- total complaints
-            complaint_resolution_rate   FLOAT   -- % complaints resolved
-            avg_handle_time_secs        INTEGER -- average handle time in seconds
-            nps_score                   INTEGER -- NPS score (0-100)
-            digital_adoption_pct        FLOAT   -- % interactions via digital channels
-            net_revenue_gbp             FLOAT   -- net revenue in GBP
+            new_signups                 INTEGER
+            wow_signup_change_pct       FLOAT
+            churn_rate_pct              FLOAT
+            total_active_customers      INTEGER
+            complaints                  INTEGER
+            complaint_resolution_rate   FLOAT
+            avg_handle_time_secs        INTEGER
+            nps_score                   INTEGER
+            digital_adoption_pct        FLOAT
+            net_revenue_gbp             FLOAT
     """,
 }
 
-# ── Use-case-specific prompt templates ────────────────────────────────────────
 PROMPT_TEMPLATES = {
-    UseCase.CHANGE_ANALYSIS: """
-You are a NatWest banking data analyst. Generate a DuckDB SQL query to explain
-what changed and why. Focus on identifying the biggest contributors to the change.
-
-Use case: CHANGE ANALYSIS — identify drivers behind increases or decreases.
-
-Rules:
-- ONLY return a single valid SQL SELECT statement. No explanation, no markdown.
-- Always aggregate — never return individual rows.
-- Include percentage change calculations where relevant.
-- Limit results to top 10 rows maximum using LIMIT 10.
-- Reference only the tables and columns listed in the schema below.
-- For month comparisons, use string comparison on the 'month' column (YYYY-MM format).
-""",
-
-    UseCase.COMPARE: """
-You are a NatWest banking data analyst. Generate a DuckDB SQL query to compare
-two or more entities (time periods, regions, products, or segments).
-
-Use case: COMPARE — side-by-side comparison with clear differences highlighted.
-
-Rules:
-- ONLY return a single valid SQL SELECT statement. No explanation, no markdown.
-- Always aggregate — never return individual rows.
-- Include both values being compared AND the difference/percentage difference.
-- Use CASE WHEN or CTEs for side-by-side comparisons.
-- Limit results to top 10 rows maximum using LIMIT 10.
-- Reference only the tables and columns listed in the schema below.
-""",
-
-    UseCase.BREAKDOWN: """
-You are a NatWest banking data analyst. Generate a DuckDB SQL query to decompose
-a metric into its components and show the contribution of each.
-
-Use case: BREAKDOWN — decompose totals, surface patterns and biggest contributors.
-
-Rules:
-- ONLY return a single valid SQL SELECT statement. No explanation, no markdown.
-- Always aggregate — never return individual rows.
-- Include both absolute values AND percentage of total (contribution share).
-- Order by the main metric descending so biggest contributors appear first.
-- Limit results to top 10 rows maximum using LIMIT 10.
-- Reference only the tables and columns listed in the schema below.
-""",
-
-    UseCase.SUMMARIZE: """
-You are a NatWest banking data analyst. Generate a DuckDB SQL query to produce
-a concise summary of key metrics for a time period.
-
-Use case: SUMMARIZE — scan for trends, anomalies, and important shifts.
-
-Rules:
-- ONLY return a single valid SQL SELECT statement. No explanation, no markdown.
-- Always aggregate — never return individual rows.
-- Include week-over-week or period-over-period comparisons where possible.
-- Focus on metrics that matter most: signups, churn, NPS, revenue, complaints.
-- Limit results to most recent 8 periods maximum using LIMIT 8.
-- Reference only the tables and columns listed in the schema below.
-""",
-
-    UseCase.UNKNOWN: """
-You are a NatWest banking data analyst. Generate a DuckDB SQL query to answer
-the user's question using the available data.
-
-Rules:
-- ONLY return a single valid SQL SELECT statement. No explanation, no markdown.
-- Always aggregate — never return individual rows.
-- Limit results to top 10 rows maximum using LIMIT 10.
-- Reference only the tables and columns listed in the schema below.
-""",
+    UseCase.CHANGE_ANALYSIS: "Generate DuckDB SQL to identify drivers behind a metric change. Focus on biggest contributors. Use aggregates only.",
+    UseCase.COMPARE:         "Generate DuckDB SQL for a side-by-side comparison. Include both values and the percentage difference.",
+    UseCase.BREAKDOWN:       "Generate DuckDB SQL to decompose a metric into components. Include percentage of total. Order by value DESC.",
+    UseCase.SUMMARIZE:       "Generate DuckDB SQL for a concise KPI summary. Include trends. LIMIT 8.",
+    UseCase.UNKNOWN:         "Generate DuckDB SQL to answer the question. Use aggregates only. LIMIT 10.",
 }
 
 
 class NLToSQL:
-    """
-    Converts natural language banking queries into valid DuckDB SQL
-    using Google Gemini 1.5 Flash with metric-aware prompting.
-    """
+    """Converts natural language banking queries into valid DuckDB SQL using Groq."""
 
     def __init__(self, metrics_yaml_path: str = "src/semantic/metrics.yaml"):
-        """
-        Initialise the NL-to-SQL converter.
-
-        Args:
-            metrics_yaml_path: Path to the semantic metric dictionary.
-        """
         self.metrics_yaml_path = metrics_yaml_path
         self._metric_context   = self._build_metric_context()
         logger.info("NLToSQL initialised")
 
     def _build_metric_context(self) -> str:
-        """
-        Build a concise metric definition context string from metrics.yaml.
-        This is injected into every LLM prompt to ensure consistent definitions.
-
-        Returns:
-            str: Formatted metric definitions for prompt injection
-        """
         try:
             with open(self.metrics_yaml_path, "r") as f:
                 metrics_data = yaml.safe_load(f)
-
-            lines = ["METRIC DEFINITIONS (always use these exact definitions):"]
+            lines = ["METRIC DEFINITIONS:"]
             for name, defn in metrics_data.get("metrics", {}).items():
-                aliases = ", ".join(defn.get("aliases", [])[:3])
                 lines.append(
-                    f"  - {defn['display_name']} ({aliases}): "
-                    f"column='{defn['column']}' in {defn['datasets']}, "
-                    f"aggregation={defn['aggregation']}"
+                    f"  - {defn['display_name']}: column='{defn['column']}' "
+                    f"in {defn['datasets']}, aggregation={defn['aggregation']}"
                 )
-
             return "\n".join(lines)
-
         except FileNotFoundError:
-            logger.warning("metrics.yaml not found — using minimal context")
             return "Use standard SQL aggregations for all metrics."
 
-    def _build_schema_context(self, datasets: list[str]) -> str:
-        """
-        Build schema context for the relevant datasets only.
+    def _registered_dataset_ids(self) -> list[str]:
+        """Return dataset ids currently registered in the project."""
+        return [item["dataset_id"] for item in list_registered_datasets()]
 
-        Args:
-            datasets: List of dataset names relevant to the query
+    def _build_schema_context(self, datasets: list) -> str:
+        blocks = []
+        for dataset_id in datasets:
+            if dataset_id in DATASET_SCHEMAS:
+                blocks.append(DATASET_SCHEMAS[dataset_id])
+                continue
 
-        Returns:
-            str: Formatted schema information for prompt injection
-        """
-        schemas = []
-        for ds in datasets:
-            if ds in DATASET_SCHEMAS:
-                schemas.append(DATASET_SCHEMAS[ds])
-        return "\n".join(schemas)
+            profile = get_dataset_profile(dataset_id)
+            if profile:
+                blocks.append(build_schema_prompt_block(dataset_id, profile))
 
-    def _build_prompt(
-        self,
-        query: str,
-        use_case: UseCase,
-        datasets: list[str],
-        resolved_time: str = None,
-    ) -> str:
-        """
-        Build the full prompt for Gemini including use-case template,
-        metric definitions, schema, and the user query.
+        return "\n\n".join(blocks)
 
-        Args:
-            query: Original natural language query
-            use_case: Classified use case from IntentRouter
-            datasets: Relevant dataset names
-            resolved_time: Optional resolved time period (from ambiguity handler)
-
-        Returns:
-            str: Complete prompt for Gemini
-        """
-        template      = PROMPT_TEMPLATES.get(use_case, PROMPT_TEMPLATES[UseCase.UNKNOWN])
+    def _build_prompt(self, query: str, use_case: UseCase, datasets: list, resolved_time: str = None) -> str:
+        template       = PROMPT_TEMPLATES.get(use_case, PROMPT_TEMPLATES[UseCase.UNKNOWN])
         schema_context = self._build_schema_context(datasets)
+        time_note      = f"\nTIME: '{resolved_time}' — use this exact value in WHERE clause.\n" if resolved_time else ""
 
-        time_note = ""
-        if resolved_time:
-            time_note = f"\nTIME RESOLUTION: '{resolved_time}' has been resolved. Use this exact date/period in your query.\n"
-
-        prompt = f"""{template}
+        return f"""You are a NatWest banking SQL expert. {template}
 
 {self._metric_context}
 
-AVAILABLE TABLE SCHEMAS:
+SCHEMAS:
 {schema_context}
 {time_note}
-IMPORTANT RULES:
-- Return ONLY a SQL SELECT statement — no markdown, no explanation, no ```sql fences
-- Do NOT use INSERT, UPDATE, DELETE, DROP, CREATE, or ALTER
-- Always use aggregate functions (SUM, AVG, COUNT) — never return raw rows
-- Use ROUND(value, 2) for all decimal values
-- Column names must exactly match the schema above
+RULES — MUST FOLLOW EXACTLY:
+1. Return ONLY a raw SQL SELECT statement — nothing else
+2. NO markdown, NO backticks, NO explanation, NO preamble
+3. Start your entire response with the word SELECT
+4. Only SELECT allowed — no INSERT/UPDATE/DELETE/DROP/CREATE
+5. Always use GROUP BY with aggregate functions
+6. ROUND all floats to 2 decimal places
+7. Column names must exactly match the schemas above
 
-USER QUESTION: {query}
+QUESTION: {query}
 
-SQL:"""
+SELECT"""
 
-        return prompt
-
-    def _validate_sql(self, sql: str) -> tuple[bool, str]:
-        """
-        Validate that the generated SQL is safe and structurally correct.
-
-        Args:
-            sql: Generated SQL string
-
-        Returns:
-            tuple: (is_valid, error_message)
-        """
+    def _validate_sql(self, sql: str) -> tuple:
         if not sql or not sql.strip():
-            return False, "Empty SQL generated"
-
+            return False, "Empty SQL"
         sql_upper = sql.upper().strip()
-
-        # Must be a SELECT statement
         if not sql_upper.startswith("SELECT"):
-            return False, "Only SELECT statements are allowed"
-
-        # Block dangerous keywords
-        dangerous = ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER",
-                     "TRUNCATE", "EXEC", "EXECUTE", "GRANT", "REVOKE"]
-        for keyword in dangerous:
-            if re.search(rf"\b{keyword}\b", sql_upper):
-                return False, f"Dangerous keyword detected: {keyword}"
-
-        # Must have at least one aggregate function (no raw row dumps)
-        aggregates = ["SUM(", "AVG(", "COUNT(", "MIN(", "MAX(", "GROUP BY"]
-        has_aggregate = any(agg in sql_upper for agg in aggregates)
-        if not has_aggregate:
-            return False, "Query must use aggregate functions — raw row queries not allowed"
-
-        # Must reference a known table
-        known_tables = list(DATASET_SCHEMAS.keys())
-        references_known_table = any(t in sql.lower() for t in known_tables)
-        if not references_known_table:
-            return False, f"Query must reference a known table: {known_tables}"
-
+            return False, "Must start with SELECT"
+        for kw in ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE"]:
+            if re.search(rf"\b{kw}\b", sql_upper):
+                return False, f"Dangerous keyword: {kw}"
+        if not any(agg in sql_upper for agg in ["SUM(", "AVG(", "COUNT(", "MIN(", "MAX(", "GROUP BY"]):
+            return False, "Must use aggregate functions"
+        known_tables = self._registered_dataset_ids() or list(DATASET_SCHEMAS.keys())
+        if not any(t in sql.lower() for t in known_tables):
+            return False, "Must reference a known table"
         return True, ""
 
-    def _clean_sql(self, raw_output: str) -> str:
-        """
-        Clean the raw LLM output to extract just the SQL statement.
-
-        Args:
-            raw_output: Raw text from Gemini
-
-        Returns:
-            str: Cleaned SQL string
-        """
-        # Remove markdown code fences if present
-        sql = re.sub(r"```sql\s*", "", raw_output, flags=re.IGNORECASE)
-        sql = re.sub(r"```\s*", "", sql)
-
-        # Remove leading/trailing whitespace
-        sql = sql.strip()
-
-        # Take only up to the first semicolon
+    def _clean_sql(self, raw: str) -> str:
+        sql = re.sub(r"```sql\s*", "", raw, flags=re.IGNORECASE)
+        sql = re.sub(r"```\s*", "", sql).strip()
+        # Ensure starts with SELECT
+        match = re.search(r"\bSELECT\b", sql, re.IGNORECASE)
+        if match:
+            sql = sql[match.start():]
         if ";" in sql:
             sql = sql[:sql.index(";") + 1]
-
         return sql.strip()
 
-    def generate(
-        self,
-        query: str,
-        use_case: UseCase,
-        datasets: list[str],
-        resolved_time: str = None,
-        max_retries: int = 2,
-    ) -> dict:
+    def _extract_time_filter(self, dataset: str, resolved_time: str = None, query: str = "") -> str:
+        """Build a simple WHERE clause when a clear time hint is available."""
+        profile = get_dataset_profile(dataset)
+        date_cols = profile.get("date_like_columns", []) if profile else []
+        if resolved_time:
+            if dataset in {"regional_revenue", "customer_metrics"}:
+                return f"WHERE month = '{resolved_time}'"
+            if dataset == "product_performance":
+                return f"WHERE week = '{resolved_time}' OR week_start_date = '{resolved_time}'"
+            if dataset == "weekly_kpis":
+                return f"WHERE week = '{resolved_time}' OR week_start_date = '{resolved_time}'"
+            if dataset == "cost_breakdown":
+                return f"WHERE quarter = '{resolved_time}'"
+            if date_cols:
+                return f"WHERE {date_cols[0]} = '{resolved_time}'"
+
+        year_match = re.search(r"\b(20\d{2})\b", query)
+        if year_match:
+            year = year_match.group(1)
+            if dataset in {"regional_revenue", "customer_metrics"}:
+                return f"WHERE month LIKE '{year}-%'"
+            if dataset in {"product_performance", "weekly_kpis"}:
+                return f"WHERE week LIKE '{year}-%' OR week_start_date LIKE '{year}-%'"
+            if dataset == "cost_breakdown":
+                return f"WHERE quarter LIKE '%-{year}'"
+            if date_cols:
+                return f"WHERE CAST({date_cols[0]} AS VARCHAR) LIKE '{year}%'"
+
+        return ""
+
+    def _fallback_generate_generic(self, dataset: str, query: str, resolved_time: str = None) -> str | None:
+        """Build generic aggregate SQL for any registered dataset profile."""
+        profile = get_dataset_profile(dataset)
+        if not profile:
+            return None
+
+        query_lower = query.lower()
+        date_cols = profile.get("date_like_columns", [])
+        numeric_cols = profile.get("numeric_columns", [])
+        categorical_cols = profile.get("categorical_columns", [])
+
+        group_col = None
+        for column in categorical_cols + date_cols:
+            if column.lower() in query_lower:
+                group_col = column
+                break
+        if group_col is None:
+            if any(token in query_lower for token in ["trend", "over time", "week", "month", "quarter", "year"]) and date_cols:
+                group_col = date_cols[0]
+            elif categorical_cols:
+                group_col = categorical_cols[0]
+            elif date_cols:
+                group_col = date_cols[0]
+
+        metric_col = None
+        for column in numeric_cols:
+            if column.lower() in query_lower:
+                metric_col = column
+                break
+        if metric_col is None and numeric_cols:
+            metric_col = numeric_cols[0]
+
+        if not metric_col:
+            if group_col:
+                return f"""
+                SELECT
+                    {group_col},
+                    COUNT(*) AS row_count
+                FROM {dataset}
+                GROUP BY {group_col}
+                ORDER BY row_count DESC
+                LIMIT 10;
+                """
+            return f"SELECT COUNT(*) AS row_count FROM {dataset};"
+
+        time_filter = self._extract_time_filter(dataset, resolved_time, query)
+        if group_col:
+            return f"""
+            SELECT
+                {group_col},
+                ROUND(SUM({metric_col}), 2) AS total_{metric_col},
+                ROUND(AVG({metric_col}), 2) AS avg_{metric_col},
+                COUNT(*) AS row_count
+            FROM {dataset}
+            {time_filter}
+            GROUP BY {group_col}
+            ORDER BY total_{metric_col} DESC
+            LIMIT 10;
+            """
+
+        return f"""
+        SELECT
+            ROUND(SUM({metric_col}), 2) AS total_{metric_col},
+            ROUND(AVG({metric_col}), 2) AS avg_{metric_col},
+            COUNT(*) AS row_count
+        FROM {dataset}
+        {time_filter};
         """
-        Generate a validated DuckDB SQL query from a natural language question.
 
-        Args:
-            query: Natural language query from the user
-            use_case: Classified use case from IntentRouter
-            datasets: Relevant datasets from IntentRouter.get_dataset_hint()
-            resolved_time: Optional time resolution from AmbiguityHandler
-            max_retries: Number of retry attempts if validation fails
+    def _fallback_generate(self, query: str, use_case: UseCase, datasets: list, resolved_time: str = None) -> dict:
+        """Fallback SQL generator used when Groq is unavailable."""
+        query_lower = query.lower()
+        dataset = datasets[0] if datasets else "weekly_kpis"
+        time_filter = self._extract_time_filter(dataset, resolved_time, query)
 
-        Returns:
-            dict: {
-                "sql": str,              — the validated SQL query
-                "valid": bool,           — whether SQL passed validation
-                "error": str | None,     — validation error if any
-                "datasets_used": list,   — datasets referenced in the query
-                "metric_definitions": list — metric definitions applied
+        regions = [r for r in ["North", "South", "East", "West", "Scotland", "Wales"] if r.lower() in query_lower]
+        products = [
+            p for p in [
+                "Personal Current Account", "Savings Account", "Mortgage", "Credit Card", "Business Loan"
+            ] if p.lower() in query_lower
+        ]
+
+        if dataset == "cost_breakdown":
+            sql = f"""
+            SELECT
+                department,
+                ROUND(SUM(cost_gbp), 2) AS total_cost_gbp,
+                ROUND(100.0 * SUM(cost_gbp) / SUM(SUM(cost_gbp)) OVER (), 2) AS pct_of_total,
+                ROUND(SUM(budget_gbp), 2) AS total_budget_gbp,
+                ROUND(AVG(variance_pct), 2) AS avg_variance_pct
+            FROM cost_breakdown
+            {time_filter}
+            GROUP BY department
+            ORDER BY total_cost_gbp DESC
+            LIMIT 10;
+            """
+        elif dataset == "regional_revenue":
+            filters = [time_filter.replace("WHERE ", "", 1)] if time_filter else []
+            if regions:
+                region_list = ", ".join(f"'{region}'" for region in regions)
+                filters.append(f"region IN ({region_list})")
+            if products:
+                product_list = ", ".join(f"'{product}'" for product in products)
+                filters.append(f"product IN ({product_list})")
+            where_clause = f"WHERE {' AND '.join(f for f in filters if f)}" if filters else ""
+            group_col = "region" if "region" in query_lower or regions else "product"
+            sql = f"""
+            SELECT
+                {group_col},
+                ROUND(SUM(revenue), 2) AS total_revenue,
+                SUM(transactions) AS total_transactions,
+                ROUND(AVG(avg_ticket), 2) AS avg_ticket_gbp,
+                ROUND(SUM(ad_spend), 2) AS total_ad_spend
+            FROM regional_revenue
+            {where_clause}
+            GROUP BY {group_col}
+            ORDER BY total_revenue DESC
+            LIMIT 10;
+            """
+        elif dataset == "customer_metrics":
+            metric_cols = []
+            if "churn" in query_lower:
+                metric_cols.extend([
+                    "ROUND(AVG(churn_rate_pct), 2) AS churn_rate_pct",
+                    "SUM(churned) AS churned_customers",
+                ])
+            if "complaint" in query_lower:
+                metric_cols.append("SUM(complaints) AS complaints")
+            if "nps" in query_lower:
+                metric_cols.append("ROUND(AVG(nps_score), 2) AS nps_score")
+            if not metric_cols:
+                metric_cols = [
+                    "SUM(new_signups) AS new_signups",
+                    "ROUND(AVG(churn_rate_pct), 2) AS churn_rate_pct",
+                    "SUM(complaints) AS complaints",
+                    "ROUND(AVG(nps_score), 2) AS nps_score",
+                ]
+            sql = f"""
+            SELECT
+                month,
+                {", ".join(metric_cols)}
+            FROM customer_metrics
+            {time_filter}
+            GROUP BY month
+            ORDER BY month DESC
+            LIMIT 8;
+            """
+        elif dataset == "product_performance":
+            filters = [time_filter.replace("WHERE ", "", 1)] if time_filter else []
+            if products:
+                product_list = ", ".join(f"'{product}'" for product in products)
+                filters.append(f"product IN ({product_list})")
+            where_clause = f"WHERE {' AND '.join(f for f in filters if f)}" if filters else ""
+            sql = f"""
+            SELECT
+                product,
+                ROUND(SUM(revenue), 2) AS total_revenue,
+                SUM(transaction_volume) AS transaction_volume,
+                ROUND(AVG(return_rate_pct), 2) AS return_rate_pct,
+                ROUND(AVG(conversion_rate_pct), 2) AS conversion_rate_pct,
+                ROUND(AVG(satisfaction_score), 2) AS satisfaction_score
+            FROM product_performance
+            {where_clause}
+            GROUP BY product
+            ORDER BY total_revenue DESC
+            LIMIT 10;
+            """
+        else:
+            sql = self._fallback_generate_generic(dataset, query, resolved_time)
+            if not sql:
+                sql = f"""
+                SELECT
+                    week,
+                    new_signups,
+                    ROUND(churn_rate_pct, 2) AS churn_rate_pct,
+                    complaints,
+                    nps_score,
+                    ROUND(net_revenue_gbp, 2) AS net_revenue_gbp,
+                    avg_handle_time_secs
+                FROM weekly_kpis
+                {time_filter}
+                ORDER BY week DESC
+                LIMIT 8;
+                """
+
+        clean_sql = self._clean_sql(sql)
+        is_valid, error = self._validate_sql(clean_sql)
+
+        if is_valid:
+            logger.warning("Using local fallback SQL generator because Groq is unavailable")
+            return {
+                "sql": clean_sql,
+                "valid": True,
+                "error": None,
+                "datasets_used": datasets,
+                "metric_definitions": self._get_applied_metrics(clean_sql),
             }
-        """
-        logger.info(f"Generating SQL for use case: {use_case.value}")
 
+        return {
+            "sql": None,
+            "valid": False,
+            "error": error or "Fallback SQL generation failed",
+            "datasets_used": datasets,
+            "metric_definitions": [],
+        }
+
+    def _is_connection_error(self, error: Exception) -> bool:
+        """Identify provider/network connectivity failures."""
+        message = str(error).lower()
+        return any(token in message for token in ["connection error", "timed out", "api connection", "network"])
+
+    def generate(self, query: str, use_case: UseCase, datasets: list,
+                 resolved_time: str = None, max_retries: int = 2) -> dict:
+        """Generate and validate a DuckDB SQL query from natural language."""
+        logger.info(f"Generating SQL | use_case={use_case.value}")
+        # Because prompt ends with SELECT, prepend it back to response
         prompt = self._build_prompt(query, use_case, datasets, resolved_time)
 
         for attempt in range(max_retries + 1):
             try:
-                
-                response = _CLIENT.models.generate_content(model="gemini-2.0-flash-lite", contents=prompt)
-                raw_sql = response.text
-
+                response = _CLIENT.chat.completions.create(
+                    model       = _MODEL,
+                    messages    = [{"role": "user", "content": prompt}],
+                    max_tokens  = 500,
+                    temperature = 0,
+                )
+                raw_content = response.choices[0].message.content
+                # Prompt ends with SELECT so prepend it if not present
+                if not raw_content.strip().upper().startswith("SELECT"):
+                    raw_content = "SELECT " + raw_content
+                clean_sql   = self._clean_sql(raw_content)
                 is_valid, error = self._validate_sql(clean_sql)
 
                 if is_valid:
-                    logger.info(f"SQL generated and validated (attempt {attempt + 1})")
+                    logger.info(f"SQL validated on attempt {attempt + 1}")
                     return {
-                        "sql":                 clean_sql,
-                        "valid":               True,
-                        "error":               None,
-                        "datasets_used":       datasets,
-                        "metric_definitions":  self._get_applied_metrics(clean_sql),
+                        "sql":                clean_sql,
+                        "valid":              True,
+                        "error":              None,
+                        "datasets_used":      datasets,
+                        "metric_definitions": self._get_applied_metrics(clean_sql),
                     }
                 else:
-                    logger.warning(f"SQL validation failed (attempt {attempt + 1}): {error}")
+                    logger.warning(f"Attempt {attempt + 1} failed: {error}")
                     if attempt < max_retries:
-                        # Add error feedback to prompt for retry
-                        prompt += f"\n\nPREVIOUS ATTEMPT FAILED: {error}. Please fix and try again."
+                        prompt += f"\n\nERROR: {error}. Fix it. Return ONLY corrected SQL starting with SELECT."
 
             except Exception as e:
-                logger.error(f"Gemini API error (attempt {attempt + 1}): {e}")
+                if self._is_connection_error(e):
+                    logger.warning(f"Groq unavailable, switching to local SQL fallback: {e}")
+                    fallback_result = self._fallback_generate(
+                        query=query,
+                        use_case=use_case,
+                        datasets=datasets,
+                        resolved_time=resolved_time,
+                    )
+                    if fallback_result["valid"]:
+                        return fallback_result
+                else:
+                    logger.error(f"Groq error attempt {attempt + 1}: {e}")
                 if attempt == max_retries:
-                    return {
-                        "sql":                None,
-                        "valid":              False,
-                        "error":              str(e),
-                        "datasets_used":      datasets,
-                        "metric_definitions": [],
-                    }
+                    fallback_result = self._fallback_generate(
+                        query=query,
+                        use_case=use_case,
+                        datasets=datasets,
+                        resolved_time=resolved_time,
+                    )
+                    if fallback_result["valid"]:
+                        return fallback_result
+                    return {"sql": None, "valid": False, "error": str(e),
+                            "datasets_used": datasets, "metric_definitions": []}
 
-        return {
-            "sql":                None,
-            "valid":              False,
-            "error":              f"SQL validation failed after {max_retries + 1} attempts",
-            "datasets_used":      datasets,
-            "metric_definitions": [],
-        }
+        return {"sql": None, "valid": False,
+                "error": f"Failed after {max_retries + 1} attempts",
+                "datasets_used": datasets, "metric_definitions": []}
 
-    def _get_applied_metrics(self, sql: str) -> list[str]:
-        """
-        Identify which metric definitions were applied in the generated SQL.
-        Used for the trust trail panel.
-
-        Args:
-            sql: Generated SQL string
-
-        Returns:
-            list[str]: Names of metrics referenced in the SQL
-        """
+    def _get_applied_metrics(self, sql: str) -> list:
         try:
             with open(self.metrics_yaml_path, "r") as f:
-                metrics_data = yaml.safe_load(f)
-
-            applied = []
+                data = yaml.safe_load(f)
             sql_lower = sql.lower()
-            for name, defn in metrics_data.get("metrics", {}).items():
-                col = defn.get("column", "")
-                if col and col.lower() in sql_lower:
-                    applied.append(defn["display_name"])
-
-            return applied
+            return [
+                defn["display_name"]
+                for defn in data.get("metrics", {}).values()
+                if defn.get("column", "").lower() in sql_lower
+            ]
         except Exception:
             return []
-
-
-# ── Quick test ────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    from src.core.intent_router import IntentRouter
-
-    router    = IntentRouter(metrics_yaml_path="src/semantic/metrics.yaml")
-    nl_to_sql = NLToSQL(metrics_yaml_path="src/semantic/metrics.yaml")
-
-    test_queries = [
-        ("Why did revenue drop in the South region in February 2024?", UseCase.CHANGE_ANALYSIS),
-        ("Compare North vs South region revenue for 2024", UseCase.COMPARE),
-        ("Show the breakdown of costs by department", UseCase.BREAKDOWN),
-        ("Give me a weekly summary for the last 4 weeks", UseCase.SUMMARIZE),
-    ]
-
-    print("\n PurpleInsight — NL to SQL Test")
-    print("=" * 60)
-
-    for query, use_case in test_queries:
-        result   = router.classify(query)
-        datasets = router.get_dataset_hint(result, query)
-        sql_result = nl_to_sql.generate(query, use_case, datasets)
-
-        print(f"\nQuery   : {query}")
-        print(f"UseCase : {use_case.value}")
-        print(f"Valid   : {sql_result['valid']}")
-        print(f"SQL     :\n{sql_result['sql']}")
-        print(f"Metrics : {sql_result['metric_definitions']}")

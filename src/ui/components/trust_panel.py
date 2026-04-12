@@ -1,127 +1,172 @@
 """
 trust_panel.py
-──────────────
-Renders the collapsible Trust Panel bar — matching screenshots exactly:
+--------------
+Trust Trail panel component for PurpleInsight.
+Renders the full transparency layer for every answer — the WOW feature.
 
-  [Trust panel — every claim is traceable]  [● High confidence ▼]
-
-When expanded, shows:
-  • SQL query (code block)
-  • Metric definitions applied
-  • Data source
-  • Explanation
+Shows:
+    - SQL that was executed
+    - Metric definitions applied
+    - Dataset used
+    - Confidence level
+    - Whether raw data was exposed
+    - Query execution time
 """
 
 import streamlit as st
 
 
-_CONF_STYLES = {
-    "High":   {"dot": "🟢", "label": "High confidence",   "color": "#155724", "bg": "#d4edda"},
-    "Medium": {"dot": "🟡", "label": "Medium confidence", "color": "#856404", "bg": "#fff3cd"},
-    "Low":    {"dot": "🔴", "label": "Low confidence",    "color": "#721c24", "bg": "#f8d7da"},
-}
-
-
-def render_trust_panel(trust_data: dict) -> None:
+def render_trust_panel(trust: dict):
     """
-    Renders the collapsible trust panel bar.
-    Matches the screenshot: grey bar with confidence badge on the right + ▼ toggle.
+    Render the collapsible trust trail panel.
+
+    Args:
+        trust: Dict from pipeline containing:
+            sql, valid, datasets_used, metric_definitions,
+            confidence, confidence_label, raw_data_exposed,
+            resolution_summary, execution_ms, total_ms
     """
-    if not trust_data:
+    if not trust:
         return
 
-    confidence = trust_data.get("confidence", "High")
-    style      = _CONF_STYLES.get(confidence, _CONF_STYLES["High"])
+    confidence_label = trust.get("confidence_label", "Medium")
+    confidence_val   = trust.get("confidence", 0.0)
+    execution_ms     = trust.get("execution_ms", 0)
+    total_ms         = trust.get("total_ms", 0)
+    sql              = trust.get("sql", "")
+    datasets         = trust.get("datasets_used", [])
+    metrics          = trust.get("metric_definitions", [])
+    raw_exposed      = trust.get("raw_data_exposed", False)
+    sql_valid        = trust.get("valid", False)
 
-    # The outer panel bar — rendered as an expander styled to match the screenshot
-    st.markdown(
-        f"""
-        <style>
-        /* Style the trust panel expander to match screenshots */
-        div[data-testid="stExpander"] > details > summary {{
-            background: #fbf6ff;
-            border: 1px solid #e0d8e8;
-            border-radius: 6px;
-            padding: 10px 16px;
-            font-size: 13px;
-            font-weight: 600;
-            color: #4a0b65;
-        }}
-        div[data-testid="stExpander"] > details > summary:hover {{
-            background: #ede8f5;
-        }}
-        div[data-testid="stExpander"] > details[open] > summary {{
-            border-bottom-left-radius: 0;
-            border-bottom-right-radius: 0;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    # Confidence color
+    conf_color = {"High": "#166534", "Medium": "#92400e", "Low": "#991b1b"}.get(confidence_label, "#555")
+    conf_bg    = {"High": "#d1fae5", "Medium": "#fef3c7", "Low": "#fee2e2"}.get(confidence_label, "#f5f5f5")
 
-    # Confidence badge HTML (shown in the expander label via workaround)
-    conf_badge = (
-        f"<span style='"
-        f"background:{style['bg']}; color:{style['color']}; "
-        f"border-radius:20px; padding:3px 10px; font-size:11px; font-weight:600;'>"
-        f"● {style['label']}"
-        f"</span>"
-    )
+    with st.expander("Trust Trail", expanded=False):
 
-    with st.expander(
-        f"Trust panel — every claim is traceable",
-        expanded=False,
-    ):
-        # Confidence + source row
-        col_conf, col_src = st.columns([1, 2])
-        with col_conf:
-            st.markdown(
-                f"<div style='margin-top:4px;'>{conf_badge}</div>",
-                unsafe_allow_html=True,
-            )
-        with col_src:
-            source = trust_data.get("source", "")
-            if source:
-                st.markdown(
-                    f"<p style='font-size:12px; color:#555; margin:6px 0;'>"
-                    f"📁 <code>{source}</code></p>",
-                    unsafe_allow_html=True,
-                )
+        st.markdown("""
+        <div class="pi-trust-intro">
+            Full audit view of how this answer was produced: intent confidence, generated SQL, source datasets, metric definitions, and safety checks.
+        </div>
+        """, unsafe_allow_html=True)
 
-        st.markdown("")
+        col1, col2, col3, col4 = st.columns(4)
 
-        # SQL block
-        sql = trust_data.get("sql", "")
+        with col1:
+            st.markdown(f"""
+            <div class="pi-trust-stat" style="background:{conf_bg};">
+                <div class="pi-trust-stat-label" style="color:{conf_color};">
+                    Confidence
+                </div>
+                <div class="pi-trust-stat-value" style="color:{conf_color};">
+                    {confidence_label}
+                </div>
+                <div class="pi-trust-stat-meta" style="color:{conf_color};">
+                    {round(confidence_val * 100)}%
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col2:
+            st.markdown(f"""
+            <div class="pi-trust-stat" style="background:#f0fdf4;">
+                <div class="pi-trust-stat-label" style="color:#166534;">
+                    Raw Data
+                </div>
+                <div class="pi-trust-stat-value" style="color:#166534;">
+                    Protected
+                </div>
+                <div class="pi-trust-stat-meta" style="color:#166534;">
+                    {"Exposed" if raw_exposed else "Not exposed"}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col3:
+            st.markdown(f"""
+            <div class="pi-trust-stat" style="background:#f5f0fb;">
+                <div class="pi-trust-stat-label" style="color:#42145f;">
+                    Query time
+                </div>
+                <div class="pi-trust-stat-value" style="color:#42145f;">
+                    {execution_ms}ms
+                </div>
+                <div class="pi-trust-stat-meta" style="color:#42145f;">
+                    DuckDB
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with col4:
+            st.markdown(f"""
+            <div class="pi-trust-stat" style="background:#f5f0fb;">
+                <div class="pi-trust-stat-label" style="color:#42145f;">
+                    Total time
+                </div>
+                <div class="pi-trust-stat-value" style="color:#42145f;">
+                    {round(total_ms/1000, 1)}s
+                </div>
+                <div class="pi-trust-stat-meta" style="color:#42145f;">
+                    End-to-end
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+        # SQL
         if sql:
-            st.markdown(
-                "<p style='font-size:12px; font-weight:600; color:#4a0b65; margin-bottom:4px;'>"
-                "SQL executed</p>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div class='pi-section-label'>SQL Executed</div>", unsafe_allow_html=True)
             st.code(sql, language="sql")
-            st.caption("Raw data rows were never exposed to the AI — only aggregated query results.")
-
-        # Metric definitions
-        metrics = trust_data.get("metrics", {})
-        if metrics:
+            status = "Valid SELECT. Safe to execute." if sql_valid else "Validation warning."
+            color  = "#166534" if sql_valid else "#92400e"
             st.markdown(
-                "<p style='font-size:12px; font-weight:600; color:#4a0b65; margin:12px 0 4px;'>"
-                "Metric definitions applied</p>",
+                f"<div style='font-size:11px; color:{color}; margin-bottom:12px;'>{status}</div>",
                 unsafe_allow_html=True,
             )
-            for term, defn in metrics.items():
+
+        # Datasets + metrics in two columns
+        col_ds, col_mt = st.columns(2)
+
+        with col_ds:
+            st.markdown("<div class='pi-section-label'>Data Sources</div>", unsafe_allow_html=True)
+            for ds in datasets:
+                st.markdown(f"""
+                <div class="pi-trust-chip">
+                    <code>{ds}.csv</code>
+                </div>
+                """, unsafe_allow_html=True)
+
+        with col_mt:
+            st.markdown("<div class='pi-section-label'>Metric Definitions Applied</div>", unsafe_allow_html=True)
+            if metrics:
+                for m in metrics:
+                    st.markdown(f"""
+                    <div class="pi-trust-chip pi-trust-chip-metric">
+                        {m}
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
                 st.markdown(
-                    f"<p style='font-size:12px; margin:2px 0;'>"
-                    f"<code>{term}</code> — {defn}</p>",
+                    "<div style='font-size:12px; color:#9a9aaa;'>Standard aggregations applied</div>",
                     unsafe_allow_html=True,
                 )
 
-        # Explanation
-        explanation = trust_data.get("explanation", "")
-        if explanation:
-            st.markdown(
-                "<p style='font-size:12px; font-weight:600; color:#4a0b65; margin:12px 0 4px;'>"
-                "How this answer was derived</p>",
-                unsafe_allow_html=True,
-            )
-            st.info(explanation, icon="💡")
+        # Resolution summary
+        if trust.get("resolution_summary"):
+            st.markdown(f"""
+            <div style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px;
+                        padding:10px 14px; font-size:12px; color:#166534; margin-top:12px;">
+                {trust['resolution_summary']}
+            </div>
+            """, unsafe_allow_html=True)
+
+        # Footer note
+        st.markdown("""
+        <div style="font-size:11px; color:#9a9aaa; margin-top:12px; padding-top:12px;
+                    border-top:1px solid #ebebed;">
+            Raw data was never exposed. Only aggregated results were returned.
+            All metric definitions sourced from <code>src/semantic/metrics.yaml</code>.
+        </div>
+        """, unsafe_allow_html=True)

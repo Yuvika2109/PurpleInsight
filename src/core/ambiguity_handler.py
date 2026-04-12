@@ -327,7 +327,7 @@ class AmbiguityHandler:
         if not result.resolutions:
             return ""
 
-        lines = ["📅 Time periods interpreted as:"]
+        lines = ["Time periods interpreted as:"]
         for term, resolution in result.resolutions.items():
             if resolution.get("auto"):
                 lines.append(f"  • '{term}' → {resolution['resolved_to']}")
@@ -350,7 +350,7 @@ if __name__ == "__main__":
         "Show me the breakdown",
     ]
 
-    print("\n🟣 PurpleInsight — Ambiguity Handler Test")
+    print("\nPurpleInsight — Ambiguity Handler Test")
     print("=" * 60)
 
     for query in test_queries:

@@ -227,7 +227,7 @@ class ChartSelector:
         Returns:
             (categorical_col, numeric_col, optional_color_col)
         """
-        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        cat_cols = df.select_dtypes(include=["object", "category", "string"]).columns.tolist()
         num_cols = df.select_dtypes(include="number").columns.tolist()
 
         cat_col = cat_cols[0] if cat_cols else df.columns[0]

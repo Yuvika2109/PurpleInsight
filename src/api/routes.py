@@ -17,6 +17,7 @@ from src.core.trust_builder import TrustBuilder, TrustTrail
 from src.core.chart_selector import ChartSelector
 from src.core.intent_router import IntentRouter
 from src.core.nl_to_sql import NLToSQL
+from src.core.narrative import Narrative
 from src.core.query_engine import QueryEngine
 
 logger = logging.getLogger(__name__)
@@ -42,9 +43,10 @@ def _load_metric_definitions() -> dict:
 _metric_definitions: dict = _load_metric_definitions()
 _trust_builder = TrustBuilder(metric_definitions=_metric_definitions)
 _chart_selector = ChartSelector()
-_intent_router  = IntentRouter()
-_nl_to_sql      = NLToSQL()
+_intent_router  = IntentRouter(metrics_yaml_path=settings.METRICS_YAML_PATH)
+_nl_to_sql      = NLToSQL(metrics_yaml_path=settings.METRICS_YAML_PATH)
 _query_engine   = QueryEngine(data_dir=settings.DATA_DIR)
+_narrative      = Narrative(metrics_yaml_path=settings.METRICS_YAML_PATH)
 _trail_store: dict[str, TrustTrail] = {}
 
 
@@ -110,8 +112,9 @@ def run_query(request: QueryRequest) -> QueryResponse:
     # 4. Execute SQL
     try:
         exec_result = _query_engine.execute(sql)
+        exec_result["datasets_used"] = datasets
         result_df = pd.DataFrame(exec_result.get("data", []))
-        data_source = exec_result.get("datasets_used", ["unknown"])[0] if exec_result.get("datasets_used") else "unknown"
+        data_source = datasets[0] if datasets else "unknown"
         if not exec_result.get("success", True):
             raise HTTPException(status_code=500, detail=exec_result.get("error", "Query failed"))
     except HTTPException:
@@ -131,7 +134,7 @@ def run_query(request: QueryRequest) -> QueryResponse:
     return QueryResponse(
         query_id=query_id,
         intent=intent_str,
-        narrative=_generate_narrative(result_df, intent_str, request.query),
+        narrative=_generate_narrative(exec_result, intent_result.use_case, request.query),
         trust_trail=trail.to_dict(),
         chart_type=_resolve_chart_type(intent_str),
         sql=sql,
@@ -151,12 +154,18 @@ def _resolve_chart_type(intent: str) -> str | None:
     return {"BREAKDOWN":"stacked_bar","COMPARE":"grouped_bar_or_line","CHANGE_ANALYSIS":"waterfall","SUMMARIZE":"kpi_cards"}.get(intent.upper())
 
 
-def _generate_narrative(df: pd.DataFrame, intent: str, query: str) -> str:
-    if df.empty:
+def _generate_narrative(query_result: dict, use_case, query: str) -> str:
+    if not query_result.get("data"):
         return "No data found. Try adjusting filters or time range."
     try:
-        from src.core.narrative import NarrativeGenerator
-        return NarrativeGenerator().generate(df=df, intent=intent, query=query)
+        narrative_result = _narrative.generate(
+            query=query,
+            use_case=use_case,
+            query_result=query_result,
+            metric_definitions=[],
+        )
+        return narrative_result.get("narrative", "Analysis complete.")
     except Exception as exc:
         logger.warning("Narrative fallback: %s", exc)
-        return f"Query returned {len(df)} rows. Top results: {df.head(5).to_dict(orient='records')}"
+        preview = pd.DataFrame(query_result.get("data", [])).head(5).to_dict(orient="records")
+        return f"Query returned {len(query_result.get('data', []))} rows. Top results: {preview}"

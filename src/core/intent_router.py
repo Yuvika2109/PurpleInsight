@@ -24,6 +24,7 @@ from loguru import logger
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+from config.dataset_registry import list_registered_datasets
 
 
 # ── Use case enum ─────────────────────────────────────────────────────────────
@@ -270,30 +271,58 @@ class IntentRouter:
         Returns:
             list[str]: Ordered list of dataset names most relevant to the query
         """
-        use_case_datasets = {
-            UseCase.CHANGE_ANALYSIS: ["regional_revenue", "customer_metrics", "weekly_kpis"],
-            UseCase.COMPARE:         ["product_performance", "regional_revenue", "customer_metrics"],
-            UseCase.BREAKDOWN:       ["cost_breakdown", "regional_revenue", "product_performance"],
-            UseCase.SUMMARIZE:       ["weekly_kpis", "customer_metrics"],
-            UseCase.UNKNOWN:         ["weekly_kpis"],
-        }
+        registered = list_registered_datasets()
+        if not registered:
+            return ["weekly_kpis"]
 
-        candidates = use_case_datasets.get(result.use_case, ["weekly_kpis"])
-
-        # Refine based on query keywords
         query_lower = query.lower()
-        if any(w in query_lower for w in ["cost", "department", "budget", "spend", "headcount"]):
-            candidates = ["cost_breakdown"] + [c for c in candidates if c != "cost_breakdown"]
-        if any(w in query_lower for w in ["product", "mortgage", "credit card", "savings"]):
-            candidates = ["product_performance"] + [c for c in candidates if c != "product_performance"]
-        if any(w in query_lower for w in ["region", "north", "south", "east", "west", "scotland", "wales"]):
-            candidates = ["regional_revenue"] + [c for c in candidates if c != "regional_revenue"]
-        if any(w in query_lower for w in ["customer", "churn", "signup", "complaint", "nps"]):
-            candidates = ["customer_metrics"] + [c for c in candidates if c != "customer_metrics"]
-        if any(w in query_lower for w in ["weekly", "week", "kpi", "summary", "overview"]):
-            candidates = ["weekly_kpis"] + [c for c in candidates if c != "weekly_kpis"]
+        use_case_name = result.use_case.value
+        scored: list[tuple[int, str]] = []
 
-        return candidates
+        for dataset in registered:
+            score = 0
+            dataset_id = dataset["dataset_id"]
+            haystacks = [
+                dataset_id.replace("_", " "),
+                dataset.get("display_name", ""),
+                dataset.get("description", ""),
+                dataset.get("category", ""),
+                " ".join(dataset.get("primary_use_cases", [])),
+            ]
+
+            if use_case_name in dataset.get("primary_use_cases", []):
+                score += 5
+            if dataset.get("category", "").lower() in query_lower:
+                score += 3
+
+            for haystack in haystacks:
+                for token in set(haystack.lower().replace("_", " ").split()):
+                    if len(token) > 3 and token in query_lower:
+                        score += 1
+
+            if any(w in query_lower for w in ["cost", "department", "budget", "spend", "headcount"]) and "cost" in dataset_id:
+                score += 4
+            if any(w in query_lower for w in ["product", "mortgage", "credit card", "savings"]) and "product" in dataset_id:
+                score += 4
+            if any(w in query_lower for w in ["region", "north", "south", "east", "west", "scotland", "wales"]) and "region" in dataset_id:
+                score += 4
+            if any(w in query_lower for w in ["customer", "churn", "signup", "complaint", "nps"]) and "customer" in dataset_id:
+                score += 4
+            if any(w in query_lower for w in ["weekly", "week", "kpi", "summary", "overview"]) and "kpi" in dataset_id:
+                score += 4
+
+            scored.append((score, dataset_id))
+
+        ranked = [dataset_id for score, dataset_id in sorted(scored, key=lambda item: (-item[0], item[1])) if score > 0]
+        if ranked:
+            return ranked
+
+        defaults = [
+            dataset["dataset_id"]
+            for dataset in registered
+            if use_case_name in dataset.get("primary_use_cases", [])
+        ]
+        return defaults or [registered[0]["dataset_id"]]
 
 
 # ── Quick test ────────────────────────────────────────────────────────────────

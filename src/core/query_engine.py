@@ -21,6 +21,7 @@ import duckdb
 import pandas as pd
 from loguru import logger
 from dotenv import load_dotenv
+from config.dataset_registry import load_dataset_registry
 
 load_dotenv()
 
@@ -68,11 +69,8 @@ class QueryEngine:
         Each CSV becomes a DuckDB view — zero data copying, reads direct from file.
         """
         datasets = {
-            "regional_revenue":    "regional_revenue.csv",
-            "customer_metrics":    "customer_metrics.csv",
-            "product_performance": "product_performance.csv",
-            "cost_breakdown":      "cost_breakdown.csv",
-            "weekly_kpis":         "weekly_kpis.csv",
+            dataset_id: meta.get("file", f"{dataset_id}.csv")
+            for dataset_id, meta in load_dataset_registry().items()
         }
 
         conn = self._conn
@@ -199,8 +197,7 @@ class QueryEngine:
         conn = self._get_connection()
         info = {}
 
-        tables = ["regional_revenue", "customer_metrics", "product_performance",
-                  "cost_breakdown", "weekly_kpis"]
+        tables = list(load_dataset_registry().keys())
 
         for table in tables:
             try:
@@ -248,7 +245,7 @@ class QueryEngine:
 if __name__ == "__main__":
     engine = QueryEngine(data_dir="data/raw")
 
-    print("\n🟣 PurpleInsight — Query Engine Test")
+    print("\nPurpleInsight — Query Engine Test")
     print("=" * 60)
 
     # Table info

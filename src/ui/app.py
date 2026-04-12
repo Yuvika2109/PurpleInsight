@@ -1,802 +1,1657 @@
 """
-app.py — PurpleInsight Main Controller
-──────────────────────────────────
-Pixel-accurate recreation of the 4 screenshot states.
+app.py — PurpleInsight Main Streamlit Application
+──────────────────────────────────────────────────
+NatWest Code for Purpose Hackathon
+Talk to Data — Seamless Self-Service Intelligence
 
-Run: python -m streamlit run src/ui/app.py
+Pages:
+    1. Analyse   — main workspace connected to full AI pipeline
+    2. How It Works — explains the system to non-technical judges
+    3. Data Explorer — browse registered datasets directly
+    4. Dataset Registry — add datasets in one central place
+
+Run:
+    streamlit run src/ui/app.py
 """
 
-import sys, os, uuid, time
+import sys
+import os
+import base64
+import uuid
+import time
+
 import streamlit as st
+import pandas as pd
+from dotenv import load_dotenv
+from config.dataset_registry import list_registered_datasets, register_dataset, slugify_dataset_id
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+# ── Path setup ────────────────────────────────────────────────────────────────
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, ROOT)
+load_dotenv(os.path.join(ROOT, ".env"))
 
-from src.ui.components.query_input    import render_query_input, render_sidebar_demo_buttons, DEMO_QUERIES
-from src.ui.components.chart_renderer import render_chart
+# ── Core pipeline imports ──────────────────────────────────────────────────────
+try:
+    from src.core.intent_router    import IntentRouter, UseCase
+    from src.core.ambiguity_handler import AmbiguityHandler
+    from src.core.nl_to_sql        import NLToSQL
+    from src.core.query_engine     import QueryEngine
+    from src.core.narrative        import Narrative
+    PIPELINE_AVAILABLE = True
+except ImportError as e:
+    PIPELINE_AVAILABLE = False
+    PIPELINE_ERROR = str(e)
+
+
+def get_llm_runtime_status() -> dict:
+    """Describe the current LLM provider configuration for the UI."""
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    if groq_key:
+        return {
+            "provider": "Groq",
+            "model": "Llama 3.1 70B",
+            "env_var": "GROQ_API_KEY",
+            "configured": True,
+        }
+
+    if gemini_key:
+        return {
+            "provider": "Gemini",
+            "model": "Gemini",
+            "env_var": "GEMINI_API_KEY",
+            "configured": True,
+        }
+
+    return {
+        "provider": "Groq",
+        "model": "Llama 3.1 70B",
+        "env_var": "GROQ_API_KEY",
+        "configured": False,
+    }
+
+
+def get_pipeline_issue(pipeline) -> str:
+    """Return the most likely reason the pipeline is unavailable."""
+    llm_status = get_llm_runtime_status()
+
+    if not PIPELINE_AVAILABLE:
+        return PIPELINE_ERROR
+
+    if not llm_status["configured"]:
+        return f"Set {llm_status['env_var']} in .env."
+
+    if llm_status["provider"] != "Groq":
+        return (
+            f"{llm_status['env_var']} is configured, but this app currently uses Groq. "
+            "Add GROQ_API_KEY to .env."
+        )
+
+    return "Pipeline failed to initialise. Check the error shown in the app for details."
+
+# ── UI component imports ───────────────────────────────────────────────────────
 from src.ui.components.trust_panel    import render_trust_panel
+from src.ui.components.chart_renderer import render_chart
+from src.ui.components.query_input    import render_query_input, DEMO_QUERIES
 
-
-# ─────────────────────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────────────────────
-
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="PurpleInsight",
-    page_icon="🏦",
-    layout="wide",
-    initial_sidebar_state="expanded",
+    page_title  = "PurpleInsight — NatWest",
+    page_icon   = os.path.join(ROOT, "assets", "natwest_logo.png"),
+    layout      = "wide",
+    initial_sidebar_state = "expanded",
 )
 
-
-# ─────────────────────────────────────────────────────────────
-# Global CSS — matches screenshots precisely
-# ─────────────────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# GLOBAL CSS — NatWest purple/white, clean, professional
+# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-/* ── Navbar ─────────────────────────────────────────────── */
-/* ── Navbar ─────────────────────────────────────────────── */
-header[data-testid="stHeader"] {
-    background: transparent !important;
-    z-index: 999999 !important;
-    top: 0 !important;
-}
-header[data-testid="stHeader"] svg {
-    stroke: white !important;
-    fill: white !important;
-    color: white !important;
-}
-header[data-testid="stHeader"] span {
-    color: white !important;
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+
+/* ── Root variables ─────────────────────────────────────────────────────── */
+:root {
+    --purple-deep:   #42145f;
+    --purple-mid:    #6b3fa0;
+    --purple-light:  #e8dff5;
+    --purple-pale:   #f5f0fb;
+    --white:         #ffffff;
+    --grey-100:      #f7f7f8;
+    --grey-200:      #ebebed;
+    --grey-400:      #9a9aaa;
+    --grey-700:      #3d3d4a;
+    --green:         #1a8754;
+    --amber:         #b45309;
+    --red:           #b91c1c;
+    --font-main:     'DM Sans', sans-serif;
+    --font-mono:     'DM Mono', monospace;
 }
 
-/* ── Custom top navbar ───────────────────────────────────── */
-/* ── Custom top navbar ───────────────────────────────────── */
-.datatalk-navbar {
-    background: #42145f;
-    padding-left: 70px;
-    padding-right: 24px;
+/* ── Global reset ───────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+html, body, [class*="css"] { font-family: var(--font-main) !important; }
+
+/* ── Hide Streamlit chrome ──────────────────────────────────────────────── */
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding-top: 1rem !important; padding-bottom: 2rem !important; }
+
+/* ── Sidebar styling ────────────────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background: var(--purple-deep) !important;
+    border-right: none !important;
+}
+section[data-testid="stSidebar"] * { color: white !important; }
+section[data-testid="stSidebar"] .stButton > button {
+    background: rgba(255,255,255,0.08) !important;
+    border: 1px solid rgba(255,255,255,0.15) !important;
+    color: white !important;
+    border-radius: 8px !important;
+    font-family: var(--font-main) !important;
+    font-size: 13px !important;
+    transition: all 0.2s !important;
+}
+section[data-testid="stSidebar"] .stButton > button:hover {
+    background: rgba(255,255,255,0.18) !important;
+    border-color: rgba(255,255,255,0.35) !important;
+}
+section[data-testid="stSidebar"] .stButton > button[kind="primary"] {
+    background: rgba(255,255,255,0.22) !important;
+    border-color: rgba(255,255,255,0.5) !important;
+    font-weight: 600 !important;
+}
+
+/* ── Navbar ─────────────────────────────────────────────────────────────── */
+.pi-navbar {
+    background: var(--purple-deep);
+    padding: 0 28px;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 52px;
-    z-index: 99;
+    height: 56px;
+    border-radius: 12px;
+    margin-bottom: 20px;
 }
-.datatalk-navbar-right {
-    padding-right: 60px;
-    display: flex;
-    align-items: center;
-}
-.datatalk-navbar-left {
+.pi-navbar-brand {
     display: flex;
     align-items: center;
     gap: 10px;
 }
-.datatalk-logo-badge {
-    background: white;
-    color: #42145f;
-    font-weight: 800;
-    font-size: 13px;
-    padding: 4px 7px;
-    border-radius: 6px;
-    letter-spacing: 0.5px;
+.pi-navbar-logo {
+    width: 42px;
+    height: 42px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background: rgba(255,255,255,0.08);
+    border-radius: 10px;
 }
-.datatalk-logo-text {
+.pi-navbar-logo img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+.pi-navbar-title {
     color: white;
     font-size: 18px;
     font-weight: 700;
-    letter-spacing: 0.3px;
+    letter-spacing: -0.3px;
 }
-.datatalk-tagline {
-    color: rgba(255,255,255,0.75);
-    font-size: 13px;
-}
-
-/* ── Sidebar labels ──────────────────────────────────────── */
-.sidebar-section-label {
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: 0.12em;
-    color: #7b4a9f;
-    text-transform: uppercase;
-    margin: 16px 0 6px;
-}
-
-/* ── Demo buttons: active state ──────────────────────────── */
-div[data-testid="stSidebar"] .stButton > button[kind="primary"] {
-    background: #f0ebf7 !important;
-    border-color: #42145f !important;
-    color: #42145f !important;
-    font-weight: 700;
-    border-radius: 6px;
-}
-div[data-testid="stSidebar"] .stButton > button[kind="secondary"] {
-    background: white !important;
-    border-color: #ddd !important;
-    color: #333 !important;
-    border-radius: 6px;
-}
-
-/* ── Metric glossary pills ───────────────────────────────── */
-.metric-pill {
-    display: inline-block;
-    background: white;
-    border: 1px solid #b39bd1;
-    color: #42145f;
-    border-radius: 20px;
-    padding: 3px 10px;
-    font-size: 11px;
-    font-weight: 600;
-    margin: 2px 3px 2px 0;
-}
-
-/* ── Recent queries ──────────────────────────────────────── */
-.recent-query-item {
+.pi-navbar-subtitle {
+    color: rgba(255,255,255,0.6);
     font-size: 12px;
-    color: #555;
-    padding: 2px 0;
-    cursor: pointer;
+    font-weight: 400;
+}
+.pi-navbar-badge {
+    background: rgba(255,255,255,0.12);
+    color: rgba(255,255,255,0.85);
+    border: 1px solid rgba(255,255,255,0.2);
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 500;
 }
 
-/* ── Feedback log card ───────────────────────────────────── */
-.feedback-log-card {
-    background: #f8f6fb;
-    border-radius: 8px;
-    padding: 10px 12px;
-    margin-top: 8px;
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+.pi-card {
+    background: white;
+    border: 1px solid var(--grey-200);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+    box-shadow: 0 12px 30px rgba(43, 18, 66, 0.04);
 }
-.feedback-score {
-    font-size: 26px;
-    font-weight: 800;
-    color: #42145f;
+.pi-card-purple {
+    background:
+        radial-gradient(circle at top right, rgba(255,255,255,0.55), transparent 32%),
+        linear-gradient(135deg, #f7f1fd 0%, #ede2fb 55%, #f8f3ff 100%);
+    border: 1px solid var(--purple-light);
+    border-radius: 18px;
+    padding: 24px;
+    margin-bottom: 18px;
+    box-shadow: 0 14px 40px rgba(66,20,95,0.08);
 }
-.feedback-sub {
+.pi-shell {
+    display: grid;
+    gap: 18px;
+}
+.pi-hero {
+    background:
+        radial-gradient(circle at top left, rgba(255,255,255,0.65), transparent 28%),
+        linear-gradient(145deg, #42145f 0%, #5e2d8a 52%, #8c63bc 100%);
+    border-radius: 24px;
+    padding: 28px 28px 24px;
+    color: white;
+    margin-bottom: 18px;
+    overflow: hidden;
+    position: relative;
+}
+.pi-hero::after {
+    content: "";
+    position: absolute;
+    inset: auto -40px -55px auto;
+    width: 180px;
+    height: 180px;
+    border-radius: 50%;
+    background: rgba(255,255,255,0.08);
+}
+.pi-eyebrow {
     font-size: 11px;
-    color: #888;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    opacity: 0.72;
+    margin-bottom: 10px;
 }
-.feedback-bar-row {
+.pi-hero-title {
+    font-size: 31px;
+    font-weight: 800;
+    line-height: 1.08;
+    letter-spacing: -0.03em;
+    margin-bottom: 10px;
+    max-width: 720px;
+}
+.pi-hero-subtitle {
+    font-size: 14px;
+    line-height: 1.7;
+    max-width: 760px;
+    color: rgba(255,255,255,0.84);
+}
+.pi-hero-meta {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 18px;
+}
+.pi-hero-pill {
+    background: rgba(255,255,255,0.12);
+    color: white;
+    border: 1px solid rgba(255,255,255,0.18);
+    border-radius: 999px;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.pi-query-shell {
+    margin-bottom: 10px;
+}
+.pi-query-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 12px;
+}
+.pi-query-title {
+    color: var(--grey-700);
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    margin-bottom: 6px;
+}
+.pi-query-subtitle {
+    color: #6d6a78;
+    font-size: 13px;
+    line-height: 1.65;
+    max-width: 720px;
+}
+.pi-query-hint {
+    color: #7a7687;
+    font-size: 12px;
+    line-height: 1.5;
+    padding-top: 6px;
+}
+.pi-chip-row {
+    margin-bottom: 10px;
+}
+.pi-workspace-grid {
+    display: grid;
+    gap: 18px;
+}
+.pi-panel-title {
+    color: var(--grey-700);
+    font-size: 18px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    margin-bottom: 6px;
+}
+.pi-panel-subtitle {
+    color: #75717f;
+    font-size: 13px;
+    line-height: 1.6;
+    margin-bottom: 2px;
+}
+.pi-section-label {
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    color: #9893a7;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+.pi-answer-card {
+    background: linear-gradient(180deg, #ffffff 0%, #fcfbfe 100%);
+}
+.pi-result-query {
     display: flex;
     align-items: center;
-    gap: 6px;
-    margin: 4px 0;
-    font-size: 11px;
+    gap: 8px;
+    color: #736d82;
+    font-size: 12px;
+    margin-bottom: 14px;
 }
-.feedback-bar-label { color: #555; min-width: 60px; }
-.feedback-bar-track {
-    flex: 1;
-    height: 5px;
-    background: #e0d8ec;
-    border-radius: 3px;
-    overflow: hidden;
+.pi-result-kpis {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
 }
-.feedback-bar-fill {
-    height: 100%;
-    background: #42145f;
-    border-radius: 3px;
+.pi-mini-stat {
+    background: #faf8fd;
+    border: 1px solid #eee6f8;
+    border-radius: 12px;
+    padding: 12px 14px;
 }
-.feedback-bar-pct { color: #42145f; font-weight: 700; min-width: 30px; text-align: right; }
-
-/* ── Query type badge ────────────────────────────────────── */
-.query-type-badge {
-    display: inline-block;
-    border: 1.5px solid #d08f4b;
-    color: #a35d12;
-    background: #fdf5ea;
-    border-radius: 20px;
-    padding: 2px 12px;
+.pi-mini-stat-label {
     font-size: 11px;
     font-weight: 700;
     letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #938da2;
+    margin-bottom: 6px;
+}
+.pi-mini-stat-value {
+    font-size: 18px;
+    font-weight: 800;
+    color: var(--purple-deep);
+}
+.pi-trust-intro {
+    font-size: 12px;
+    color: #706b7d;
+    line-height: 1.6;
+    margin-bottom: 14px;
+}
+.pi-trust-stat {
+    text-align: center;
+    padding: 14px 12px;
+    border-radius: 12px;
+}
+.pi-trust-stat-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+.pi-trust-stat-value {
+    font-size: 20px;
+    font-weight: 800;
+    margin-top: 5px;
+}
+.pi-trust-stat-meta {
+    font-size: 11px;
+    opacity: 0.8;
+}
+.pi-trust-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    background: #f9f9fb;
+    border-radius: 8px;
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: #42145f;
+}
+.pi-trust-chip-metric {
+    background: #f5f0fb;
+    color: #6b3fa0;
+}
+.pi-history-card {
+    background: linear-gradient(180deg, #ffffff 0%, #fcfbfe 100%);
+}
+.pi-history-item {
+    border: 1px solid #efe8f6;
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    background: #fbf9fd;
+}
+.pi-history-title {
+    color: var(--grey-700);
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1.5;
+    margin-bottom: 6px;
+}
+.pi-history-meta {
+    font-size: 11px;
+    color: #958ea6;
+}
+
+/* ── Query badge ────────────────────────────────────────────────────────── */
+.pi-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     margin-bottom: 12px;
 }
+.pi-badge-change  { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+.pi-badge-compare { background: #dbeafe; color: #1e40af; border: 1px solid #93c5fd; }
+.pi-badge-breakdown { background: #d1fae5; color: #065f46; border: 1px solid #6ee7b7; }
+.pi-badge-summary { background: var(--purple-light); color: var(--purple-deep); border: 1px solid #c4b0e0; }
+.pi-badge-unknown { background: var(--grey-200); color: var(--grey-700); border: 1px solid #ccc; }
 
-/* ── Answer card ─────────────────────────────────────────── */
-.answer-card {
-    border-left: 4px solid #42145f;
-    padding: 14px 20px;
-    margin-bottom: 14px;
-    background: #f8f5fb;
-    border-radius: 0 8px 8px 0;
-}
-.answer-headline {
-    font-size: 16px;
+/* ── Answer headline ────────────────────────────────────────────────────── */
+.pi-headline {
+    font-size: 17px;
     font-weight: 700;
-    color: #111;
-    margin: 0 0 8px;
+    color: var(--grey-700);
     line-height: 1.4;
-}
-.answer-body {
-    font-size: 13px;
-    color: #444;
-    line-height: 1.6;
     margin: 0 0 10px;
+    border-left: 3px solid var(--purple-deep);
+    padding-left: 12px;
 }
-.answer-impact-label {
-    font-size: 11px;
-    font-weight: 800;
-    letter-spacing: 0.08em;
-    color: #4a1f6a;
-    text-transform: uppercase;
-    margin-bottom: 3px;
-}
-.answer-impact-text {
-    font-size: 12px;
+.pi-body {
+    font-size: 13.5px;
     color: #555;
-    font-style: italic;
-    margin: 0;
+    line-height: 1.65;
+    margin: 0 0 12px;
 }
 
-/* ── Feedback row ────────────────────────────────────────── */
-.feedback-row-card {
-    border: 1px solid #e8e0f0;
+/* ── Key facts ──────────────────────────────────────────────────────────── */
+.pi-fact-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--grey-200);
+    font-size: 13px;
+    color: var(--grey-700);
+}
+.pi-fact-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--purple-mid);
+    margin-top: 6px;
+    flex-shrink: 0;
+}
+
+/* ── Anomaly alert ──────────────────────────────────────────────────────── */
+.pi-anomaly {
+    background: #fef9ec;
+    border: 1px solid #fcd34d;
     border-radius: 8px;
-    padding: 12px 16px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: #78350f;
+    margin-bottom: 12px;
+}
+
+/* ── Metric pills ───────────────────────────────────────────────────────── */
+.pi-pill {
+    display: inline-block;
+    background: rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.2);
+    color: rgba(255,255,255,0.9) !important;
+    border-radius: 20px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 500;
+    margin: 2px 3px 2px 0;
+}
+
+/* ── Sidebar section label ──────────────────────────────────────────────── */
+.pi-sidebar-label {
+    font-size: 9px !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.14em !important;
+    color: rgba(255,255,255,0.45) !important;
+    text-transform: uppercase !important;
+    margin: 20px 0 8px !important;
+}
+
+/* ── Loading state ──────────────────────────────────────────────────────── */
+.pi-loading {
     display: flex;
     align-items: center;
-    gap: 16px;
-    margin-bottom: 14px;
-    background: white;
-}
-
-/* ── Results section ─────────────────────────────────────── */
-.results-card {
-    border: 1px solid #e8e0f0;
-    border-radius: 8px;
-    padding: 14px;
-    background: white;
-    margin-bottom: 14px;
-}
-
-/* ── Follow-up suggestions ───────────────────────────────── */
-.followup-btn > button {
-    background: white !important;
-    border: 1px solid #ddd !important;
-    color: #333 !important;
-    border-radius: 20px !important;
-    font-size: 12px !important;
-    padding: 4px 14px !important;
-}
-.followup-btn > button:hover {
-    border-color: #42145f !important;
-    color: #42145f !important;
-}
-
-/* ── Analyse button ──────────────────────────────────────── */
-div[data-testid="stMainBlockContainer"] .stButton > button[kind="primary"] {
-    background: #42145f !important;
-    border-color: #42145f !important;
-    border-radius: 6px !important;
-    font-weight: 600 !important;
-    font-size: 15px !important;
-    height: 44px !important;
-}
-
-/* ── Main query input ────────────────────────────────────── */
-div[data-testid="stMainBlockContainer"] .stTextInput > div > input {
-    border: 1.5px solid #ddd;
-    border-radius: 6px;
+    gap: 10px;
+    padding: 20px;
+    color: var(--purple-mid);
     font-size: 14px;
-    height: 44px;
-    padding: 0 14px;
-}
-div[data-testid="stMainBlockContainer"] .stTextInput > div > input:focus {
-    border-color: #42145f;
-    box-shadow: 0 0 0 2px rgba(66,20,95,0.12);
 }
 
-/* ── Hide sidebar border ─────────────────────────────────── */
-section[data-testid="stSidebar"] { border-right: none; }
-[data-testid="stSidebar"] {
-    background-color: #fcfbfe !important;
+/* ── How it works cards ─────────────────────────────────────────────────── */
+.hiw-step {
+    background: white;
+    border: 1px solid var(--grey-200);
+    border-radius: 12px;
+    padding: 20px;
+    position: relative;
+}
+.hiw-step-number {
+    width: 32px;
+    height: 32px;
+    background: var(--purple-deep);
+    color: white;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 14px;
+    margin-bottom: 12px;
+}
+.hiw-step-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--grey-700);
+    margin-bottom: 6px;
+}
+.hiw-step-body {
+    font-size: 13px;
+    color: #666;
+    line-height: 1.55;
 }
 
-/* ── Add padding to block container and sidebar so they aren't hidden by the fixed header ── */
-.block-container { padding-top: 3rem !important; }
-section[data-testid="stSidebar"] > div { padding-top: 2rem !important; }
+/* ── Data explorer table ────────────────────────────────────────────────── */
+.pi-table-header {
+    background: var(--purple-deep);
+    color: white;
+    padding: 10px 16px;
+    border-radius: 8px 8px 0 0;
+    font-weight: 600;
+    font-size: 13px;
+}
+
+/* ── Primary button override ────────────────────────────────────────────── */
+div[data-testid="stMainBlockContainer"] .stButton > button[kind="primary"],
+.stButton > button[kind="primary"] {
+    background: var(--purple-deep) !important;
+    border-color: var(--purple-deep) !important;
+    color: white !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    font-family: var(--font-main) !important;
+    transition: all 0.2s !important;
+}
+div[data-testid="stMainBlockContainer"] .stButton > button[kind="primary"]:hover {
+    background: var(--purple-mid) !important;
+    border-color: var(--purple-mid) !important;
+}
+
+/* ── Text input ─────────────────────────────────────────────────────────── */
+.stTextInput > div > input {
+    border: 1.5px solid var(--grey-200) !important;
+    border-radius: 8px !important;
+    font-family: var(--font-main) !important;
+    font-size: 14px !important;
+    padding: 10px 14px !important;
+    transition: border-color 0.2s !important;
+}
+.stTextInput > div > input:focus {
+    border-color: var(--purple-deep) !important;
+    box-shadow: 0 0 0 3px rgba(66,20,95,0.08) !important;
+}
+
+/* ── Selectbox ──────────────────────────────────────────────────────────── */
+.stSelectbox > div > div {
+    border: 1.5px solid var(--grey-200) !important;
+    border-radius: 8px !important;
+    font-family: var(--font-main) !important;
+}
+
+/* ── Expander ───────────────────────────────────────────────────────────── */
+.streamlit-expanderHeader {
+    background: var(--purple-pale) !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    color: var(--purple-deep) !important;
+}
+
+/* ── Divider ─────────────────────────────────────────────────────────────── */
+.pi-divider {
+    border: none;
+    border-top: 1px solid var(--grey-200);
+    margin: 20px 0;
+}
+
+/* ── Ambiguity banner ───────────────────────────────────────────────────── */
+.pi-clarify {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 10px;
+    padding: 14px 18px;
+    font-size: 13px;
+    color: #1e40af;
+    margin-bottom: 14px;
+}
+
+/* ── Empty state ────────────────────────────────────────────────────────── */
+.pi-empty {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--grey-400);
+}
+.pi-empty-icon { font-size: 48px; margin-bottom: 12px; }
+.pi-empty-title { font-size: 16px; font-weight: 600; color: var(--grey-700); margin-bottom: 6px; }
+.pi-empty-sub { font-size: 13px; }
+
+/* ── Stats row ───────────────────────────────────────────────────────────── */
+.pi-stat {
+    text-align: center;
+    padding: 16px;
+    background: linear-gradient(180deg, #ffffff 0%, #faf7fd 100%);
+    border: 1px solid #ece3f5;
+    border-radius: 14px;
+    box-shadow: 0 10px 26px rgba(43, 18, 66, 0.04);
+}
+.pi-stat-value { font-size: 24px; font-weight: 800; color: var(--purple-deep); }
+.pi-stat-label { font-size: 11px; color: var(--grey-400); font-weight: 500; margin-top: 2px; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────────────
-# Mock data — one result per demo query type
-# ─────────────────────────────────────────────────────────────
+def get_natwest_logo_data_uri() -> str:
+    """Return the NatWest logo as a data URI for HTML rendering."""
+    logo_path = os.path.join(ROOT, "assets", "natwest_logo.png")
+    with open(logo_path, "rb") as handle:
+        encoded = base64.b64encode(handle.read()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
 
-MOCK_RESULTS = {
 
-    "Breakdown": {
-        "query_type":   "breakdown",
-        "query_label":  "BREAKDOWN",
-        "headline":     "Mortgages drive 38.4% of total revenue — nearly double the next product.",
-        "body":         "Mortgages generated £48.7M across all regions over 18 months, followed by business accounts at £24.2M (19.1%) and personal loans at £21.8M (17.2%). Credit cards and savings combined account for the remaining 25.3%.",
-        "impact":       "Mortgage concentration creates interest rate sensitivity — a 1% rate shift could materially alter the entire revenue mix.",
-        "chart": {
-            "query_type": "breakdown",
-            "x_col":  "product",
-            "y_col":  "revenue_m",
-            "title":  "Revenue by product type",
-            "data": [
-                {"product": "Mortgage",     "revenue_m": 48.7},
-                {"product": "Business",     "revenue_m": 24.2},
-                {"product": "Personal",     "revenue_m": 21.8},
-                {"product": "Credit £",     "revenue_m": 15.4},
-                {"product": "Savings",      "revenue_m": 10.1},
-            ],
-            "table": {
-                "columns":   ["Product", "Revenue", "Share"],
-                "n_rows": 5, "query_ms": 8,
-                "rows": [
-                    ["mortgage",       "£48.7M", "38.4%"],
-                    ["business_acc.",  "£24.2M", "19.1%"],
-                    ["personal_loan",  "£21.8M", "17.2%"],
-                    ["credit_card",    "£15.4M", "12.1%"],
-                    ["savings_acc.",   "£10.1M", " 8.0%"],
-                ],
-            },
-        },
+# ══════════════════════════════════════════════════════════════════════════════
+# Pipeline singleton — cached across sessions
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner=False)
+def load_pipeline():
+    """
+    Load and cache all pipeline components on first call.
+    Cached by Streamlit so models load once, not per query.
+    """
+    if not PIPELINE_AVAILABLE:
+        return None
+
+    try:
+        metrics_path = os.path.join(ROOT, "src", "semantic", "metrics.yaml")
+        data_dir     = os.path.join(ROOT, "data", "raw")
+
+        return {
+            "router":    IntentRouter(metrics_yaml_path=metrics_path),
+            "ambiguity": AmbiguityHandler(metrics_yaml_path=metrics_path),
+            "nl_to_sql": NLToSQL(metrics_yaml_path=metrics_path),
+            "engine":    QueryEngine(data_dir=data_dir),
+            "narrator":  Narrative(metrics_yaml_path=metrics_path),
+        }
+    except Exception as e:
+        st.error(f"Pipeline load error: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Session state init
+# ══════════════════════════════════════════════════════════════════════════════
+
+def init_session():
+    """Initialise all session state keys on first load."""
+    defaults = {
+        "chat_history":    [],
+        "active_demo":     None,
+        "prefill_query":   "",
+        "auto_submit":     False,
+        "page":            "Analyse",
+        "feedback_counts": {"positive": 0, "negative": 0},
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pipeline runner
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_pipeline(query: str, pipeline: dict) -> dict:
+    """
+    Run the full PurpleInsight pipeline for a user query.
+
+    Steps:
+        1. Ambiguity handler — resolve vague time references
+        2. Intent router     — classify into 4 use cases
+        3. NL to SQL         — generate DuckDB SQL via Groq
+        4. Query engine      — execute SQL against DuckDB
+        5. Narrative         — generate plain-English answer via Groq
+
+    Args:
+        query:    Natural language user query
+        pipeline: Dict of loaded pipeline components
+
+    Returns:
+        dict: Full result including answer, chart data, trust trail
+    """
+    start_time = time.time()
+
+    # Step 1 — ambiguity resolution
+    ambiguity_result = pipeline["ambiguity"].analyse(query)
+    time_hints       = pipeline["ambiguity"].get_sql_time_hints(ambiguity_result)
+    resolution_summary = pipeline["ambiguity"].format_resolution_summary(ambiguity_result)
+
+    # Step 2 — intent classification
+    intent_result = pipeline["router"].classify(query)
+    datasets      = pipeline["router"].get_dataset_hint(intent_result, query)
+
+    # Step 3 — NL to SQL
+    resolved_time = list(time_hints.values())[0] if time_hints else None
+    sql_result    = pipeline["nl_to_sql"].generate(
+        query        = query,
+        use_case     = intent_result.use_case,
+        datasets     = datasets,
+        resolved_time= resolved_time,
+    )
+
+    # Step 4 — execute SQL
+    if sql_result["valid"] and sql_result["sql"]:
+        query_result = pipeline["engine"].execute(sql_result["sql"])
+        query_result["datasets_used"] = datasets
+    else:
+        query_result = {
+            "success":   False,
+            "data":      [],
+            "columns":   [],
+            "row_count": 0,
+            "error":     sql_result.get("error", "SQL generation failed"),
+            "execution_time_ms": 0,
+            "datasets_used": datasets,
+        }
+
+    # Step 5 — narrative
+    narrative_result = pipeline["narrator"].generate(
+        query              = query,
+        use_case           = intent_result.use_case,
+        query_result       = query_result,
+        metric_definitions = sql_result.get("metric_definitions", []),
+    )
+
+    total_ms = round((time.time() - start_time) * 1000)
+
+    return {
+        # Core answer
+        "headline":   narrative_result["headline"],
+        "narrative":  narrative_result["narrative"],
+        "key_facts":  narrative_result["key_facts"],
+        "anomalies":  narrative_result["anomalies"],
+        "success":    narrative_result["success"],
+
+        # Use case info
+        "use_case":   intent_result.use_case,
+        "confidence": intent_result.confidence,
+
+        # Ambiguity
+        "needs_clarification":    ambiguity_result.needs_clarification,
+        "clarification_question": ambiguity_result.clarification_question,
+        "resolution_summary":     resolution_summary,
+
+        # Data
+        "data":     query_result.get("data", []),
+        "columns":  query_result.get("columns", []),
+        "row_count": query_result.get("row_count", 0),
+        "query_ms": query_result.get("execution_time_ms", 0),
+
+        # Trust trail
         "trust": {
-            "confidence": "High",
-            "source":     "monthly_metrics",
-            "sql":        "SELECT product_type,\n       ROUND(SUM(revenue)/1e6, 1)          AS revenue_m,\n       ROUND(SUM(revenue)*100.0/SUM(SUM(revenue)) OVER(), 1) AS share_pct\nFROM monthly_metrics\nGROUP BY product_type\nORDER BY revenue_m DESC\nLIMIT 20",
-            "metrics":    {"revenue": "Total transaction value credited to the bank (£)", "product_type": "FCA-registered product category"},
-            "explanation": "Revenue was aggregated across all regions and 18 months, then normalised as a percentage of total. Mortgage share calculated using SUM(revenue) OVER() window function.",
+            "sql":                sql_result.get("sql", ""),
+            "valid":              sql_result.get("valid", False),
+            "datasets_used":      datasets,
+            "metric_definitions": sql_result.get("metric_definitions", []),
+            "confidence":         intent_result.confidence,
+            "confidence_label":   "High" if intent_result.confidence > 0.7 else "Medium" if intent_result.confidence > 0.45 else "Low",
+            "intent_method":      intent_result.method,
+            "raw_data_exposed":   False,
+            "resolution_summary": resolution_summary,
+            "execution_ms":       query_result.get("execution_time_ms", 0),
+            "total_ms":           total_ms,
         },
-        "followups": ["Break down by region →", "Mortgage vs credit card trend →", "Monthly mortgage revenue →"],
-    },
 
-    "Comparison": {
-        "query_type":  "comparison",
-        "query_label": "COMPARISON",
-        "headline":    "North outperforms South by £3.1M (+26.6%) in 2024 — the largest regional gap in the dataset.",
-        "body":        "North generated £14.75M vs South at £11.64M across Jan–Jun 2024. South was severely impacted in Feb–Apr where revenue fell 27.6%, coinciding with churn rising to 9.1%.",
-        "impact":      "South's Feb–Apr underperformance risks widening the regional gap further in H2 if retention issues go unaddressed.",
+        # Chart data (passed to chart_renderer)
         "chart": {
-            "query_type": "comparison",
-            "x_col": "month", "y1_col": "north", "y2_col": "south",
-            "title": "Monthly revenue — North vs South 2024",
-            "data": [
-                {"month": "Jan", "north": 2.41, "south": 2.24},
-                {"month": "Feb", "north": 2.38, "south": 1.48},
-                {"month": "Mar", "north": 2.51, "south": 1.53},
-                {"month": "Apr", "north": 2.45, "south": 1.54},
-                {"month": "May", "north": 2.52, "south": 2.21},
-                {"month": "Jun", "north": 2.48, "south": 2.64},
-            ],
-            "annotation": {
-                "x": "Mar", "y": 1.53,
-                "text": "South drop (Feb–Apr)",
-                "drop_xs": ["Feb", "Mar", "Apr"],
-                "drop_ys": [1.48, 1.53, 1.54],
-            },
-            "table": {
-                "columns": ["Month", "North", "South"],
-                "n_rows": 6, "query_ms": 14,
-                "anomaly_col": "South", "anomaly_val": "£1.48M",
-                "rows": [
-                    ["2024-01", "£2.41M", "£2.24M"],
-                    ["2024-02", "£2.38M", "£1.48M"],
-                    ["2024-03", "£2.51M", "£1.53M"],
-                    ["2024-04", "£2.45M", "£1.54M"],
-                    ["2024-05", "£2.52M", "£2.21M"],
-                    ["2024-06", "£2.48M", "£2.64M"],
-                ],
-            },
+            "query_type": intent_result.use_case.value,
+            "data":       query_result.get("data", []),
+            "columns":    query_result.get("columns", []),
         },
-        "trust": {
-            "confidence": "High",
-            "source":     "monthly_metrics",
-            "sql":        "SELECT month,\n       SUM(CASE WHEN region='North' THEN revenue END)/1e6 AS north,\n       SUM(CASE WHEN region='South' THEN revenue END)/1e6 AS south\nFROM monthly_metrics\nWHERE year = 2024\nGROUP BY month\nORDER BY month ASC",
-            "metrics":    {"revenue": "Total transaction value credited (£)", "region": "ONS standard UK region"},
-            "explanation": "Revenue was pivoted by region using conditional aggregation. Month-over-month comparison uses the same metric definition for both regions to ensure consistency.",
-        },
-        "followups": ["Why did South drop? →", "All 7 regions →", "South churn trend →"],
-    },
 
-    "Change analysis": {
-        "query_type":  "change",
-        "query_label": "CHANGE ANALYSIS",
-        "headline":    "South region revenue fell £543k (−27.6%) in Feb–Apr 2024, driven by a churn spike from 5.3% to 9.1%.",
-        "body":        "Revenue dropped from £2.24M in January to £1.48M in February and stayed suppressed through April. Churn jumped simultaneously — pointing to a retention failure, not a seasonal dip.",
-        "impact":      "Estimated £1.1M annualised impact if churn remains elevated — equivalent to ~400 customers lost per month.",
-        "chart": {
-            "query_type": "change",
-            "x_col": "month", "y_col": "revenue_m",
-            "title": "South region monthly revenue",
-            "data": [
-                {"month": "Nov", "revenue_m": 2.10},
-                {"month": "Dec", "revenue_m": 2.02},
-                {"month": "Jan", "revenue_m": 2.24},
-                {"month": "Feb", "revenue_m": 1.48},
-                {"month": "Mar", "revenue_m": 1.53},
-                {"month": "Apr", "revenue_m": 1.54},
-                {"month": "May", "revenue_m": 2.21},
-            ],
-            "annotation": {
-                "x0": "Feb", "x1": "Apr",
-                "label_x": "Mar", "label_y": 1.35,
-                "text": "Drop window (−27.6%)",
-                "drop_xs": ["Feb", "Mar", "Apr"],
-                "drop_ys": [1.48, 1.53, 1.54],
-            },
-            "table": {
-                "columns": ["Month", "Revenue", "Churn"],
-                "n_rows": 7, "query_ms": 11,
-                "anomaly_col": "Churn", "anomaly_val": "9.1%",
-                "rows": [
-                    ["2023-11", "£2.10M", "5.1%"],
-                    ["2023-12", "£2.02M", "5.3%"],
-                    ["2024-01", "£2.24M", "5.4%"],
-                    ["2024-02", "£1.48M", "9.1%"],
-                    ["2024-03", "£1.53M", "8.8%"],
-                    ["2024-04", "£1.54M", "9.4%"],
-                    ["2024-05", "£2.21M", "6.2%"],
-                ],
-            },
-        },
-        "trust": {
-            "confidence": "High",
-            "source":     "monthly_metrics",
-            "sql":        "SELECT month, revenue/1e6 AS revenue_m, churn_rate\nFROM monthly_metrics\nWHERE region = 'South'\n  AND year IN (2023, 2024)\nORDER BY month ASC\nLIMIT 20",
-            "metrics":    {"churn_rate": "% of active customers who closed their account in the month", "revenue": "Total credited value (£)"},
-            "explanation": "Revenue and churn were pulled for the South region across a 7-month window. The drop window was identified by comparing Feb–Apr values against the Jan baseline. Churn spike confirms this is demand-driven, not supply-side.",
-        },
-        "followups": ["By product in South →", "South vs all regions →", "New customers trend →"],
-    },
-
-    "Summary": {
-        "query_type":  "summary",
-        "query_label": "SUMMARY",
-        "headline":    "Customer base grew 4.2% in H1 2024, but churn spiked to 9.4% in April — the highest in 18 months.",
-        "body":        "Active customers rose from 182,400 in January to 190,100 by June driven by ~3,200 new customers/month. The notable exception was Feb–Apr where elevated churn offset acquisition gains. Online channel share reached 68% by June, up from 42% a year prior.",
-        "impact":      "The Q1 churn event cost ~2,800 customers net — approximately £3.2M in annualised revenue if unaddressed.",
-        "chart": {
-            "query_type": "summary",
-            "x_col": "month", "y1_col": "active", "y2_col": "churn_pct",
-            "title": "Active customers & churn — 2024",
-            "anomaly_xs": ["Feb", "Mar", "Apr"],
-            "data": [
-                {"month": "Jan", "active": 182400, "churn_pct": 5.4},
-                {"month": "Feb", "active": 180900, "churn_pct": 8.8},
-                {"month": "Mar", "active": 179800, "churn_pct": 9.4},
-                {"month": "Apr", "active": 181200, "churn_pct": 8.8},
-                {"month": "May", "active": 185700, "churn_pct": 6.2},
-                {"month": "Jun", "active": 190100, "churn_pct": 5.8},
-            ],
-            "table": {
-                "columns": ["Month", "Active", "Churn", "New"],
-                "n_rows": 6, "query_ms": 9,
-                "anomaly_col": "Churn", "anomaly_val": "9.4%",
-                "rows": [
-                    ["Jan", "182,400", "5.4%", "3,100"],
-                    ["Feb", "180,900", "8.8%", "2,200"],
-                    ["Mar", "179,800", "9.4%", "2,100"],
-                    ["Apr", "181,200", "8.8%", "3,600"],
-                    ["May", "185,700", "6.2%", "3,500"],
-                    ["Jun", "190,100", "5.8%", "3,400"],
-                ],
-            },
-        },
-        "trust": {
-            "confidence": "High",
-            "source":     "monthly_metrics",
-            "sql":        "SELECT month,\n       active_customers,\n       churn_rate        AS churn_pct,\n       new_customers\nFROM monthly_metrics\nWHERE year = 2024\nORDER BY month ASC\nLIMIT 12",
-            "metrics":    {"active_customers": "Distinct customers with ≥1 transaction in the month", "churn_rate": "% of start-of-month customers who closed account", "new_customers": "First-time account openers in the month"},
-            "explanation": "Customer metrics were pulled directly from the monthly_metrics table filtered to 2024. Churn rate uses the standard definition: closures / active_start × 100. New customers are counted on first account-open event.",
-        },
-        "followups": ["Churn by region →", "Revenue same period →", "Online vs branch shift →"],
-    },
-}
+        "total_ms": total_ms,
+    }
 
 
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Navbar
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_navbar():
+    """Render the top navigation bar."""
+    logo_data_uri = get_natwest_logo_data_uri()
+    st.markdown(f"""
+    <div class="pi-navbar">
+        <div class="pi-navbar-brand">
+            <div class="pi-navbar-logo"><img src="{logo_data_uri}" alt="NatWest logo" /></div>
+            <div>
+                <div class="pi-navbar-title">PurpleInsight</div>
+                <div class="pi-navbar-subtitle">NatWest · Self-Service Banking Intelligence</div>
+            </div>
+        </div>
+        <div class="pi-navbar-badge">Code for Purpose Hackathon 2025</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Sidebar
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-METRIC_PILLS = ["revenue", "churn_rate", "active_customers", "avg_transaction_value", "new_customers"]
+def render_sidebar(pipeline) -> str | None:
+    """
+    Render the full sidebar with navigation, demo queries, and metrics glossary.
 
-FEEDBACK_DATA = {
-    "score": 82,
-    "total": 11,
-    "thumbs_up": 9,
-    "thumbs_down": 2,
-    "by_type": {
-        "breakdown": 90,
-        "compare":   85,
-        "change":    60,
-        "summary":  100,
-    },
-}
+    Returns:
+        str | None: Demo query string if a demo button was clicked
+    """
+    triggered = None
+    llm_status = get_llm_runtime_status()
+    pipeline_issue = get_pipeline_issue(pipeline)
 
-
-def render_sidebar(active_demo: str | None) -> str | None:
-    """Renders the full sidebar. Returns a demo query string if a button was clicked."""
     with st.sidebar:
+        logo_data_uri = get_natwest_logo_data_uri()
+        # Logo + brand
+        st.markdown(f"""
+        <div style="padding: 4px 0 20px;">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+                <img src="{logo_data_uri}" alt="NatWest logo" style="width:34px; height:34px; object-fit:contain; border-radius:8px;" />
+                <div style="font-size:20px; font-weight:800; letter-spacing:-0.5px;">PurpleInsight</div>
+            </div>
+            <div style="font-size:11px; opacity:0.55; margin-top:2px;">NatWest Banking Intelligence</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        # Demo queries section
-        triggered = render_sidebar_demo_buttons(active_demo)
+        # Navigation
+        st.markdown("<div class='pi-sidebar-label'>NAVIGATION</div>", unsafe_allow_html=True)
+        pages = ["Analyse", "How It Works", "Data Explorer", "Dataset Registry"]
+        for page in pages:
+            is_active = st.session_state["page"] == page
+            if st.button(
+                page,
+                key=f"nav_{page}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state["page"] = page
+                st.rerun()
 
-        # Metric glossary
-        st.markdown(
-            "<p class='sidebar-section-label'>METRIC GLOSSARY</p>",
-            unsafe_allow_html=True,
-        )
-        pills_html = " ".join(
-            f"<span class='metric-pill'>{p}</span>" for p in METRIC_PILLS
-        )
-        st.markdown(pills_html, unsafe_allow_html=True)
+        # Demo queries
+        st.markdown("<div class='pi-sidebar-label'>TRY A DEMO QUERY</div>", unsafe_allow_html=True)
 
-        # Recent queries (only show if there's history)
-        history = st.session_state.get("chat_history", [])
-        if history:
+        demo_map = {
+            "Revenue drop analysis": "Why did revenue drop in the South region last month?",
+            "Region comparison": "Compare North vs South region revenue for 2024",
+            "Cost breakdown": "Show the breakdown of costs by department",
+            "Weekly summary": "Give me a weekly summary of customer metrics",
+            "Product performance": "Compare Personal Current Account vs Credit Card performance this year",
+            "Customer churn analysis": "What caused customer churn to rise in Q3?",
+        }
+
+        active = st.session_state.get("active_demo")
+        for label, query in demo_map.items():
+            is_active = active == label
+            if st.button(
+                label,
+                key=f"demo_{label}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                triggered = query
+                st.session_state["active_demo"] = label
+
+        # Metrics glossary
+        st.markdown("<div class='pi-sidebar-label'>METRIC GLOSSARY</div>", unsafe_allow_html=True)
+        metrics = ["revenue", "churn_rate", "nps_score", "new_signups",
+                   "avg_handle_time", "active_customers", "digital_adoption"]
+        pills = " ".join(f"<span class='pi-pill'>{m}</span>" for m in metrics)
+        st.markdown(pills, unsafe_allow_html=True)
+
+        # Pipeline status
+        st.markdown("<div class='pi-sidebar-label'>SYSTEM STATUS</div>", unsafe_allow_html=True)
+        if pipeline:
+            st.markdown("""
+            <div style="font-size:12px; opacity:0.8;">
+                AI pipeline ready<br>
+                DuckDB connected<br>
+                Registered datasets loaded<br>
+                Groq Llama active
+            </div>
+            """, unsafe_allow_html=True)
+        else:
             st.markdown(
-                "<p class='sidebar-section-label'>RECENT QUERIES</p>",
+                f"""
+                <div style="font-size:12px; opacity:0.8;">
+                    Pipeline not connected<br>
+                    <span style="opacity:0.6;">Provider: {llm_status['provider']} ({llm_status['model']})</span><br>
+                    <span style="opacity:0.6;">{pipeline_issue}</span>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
-            seen = set()
-            recent_unique = []
-            for entry in reversed(history):
-                if entry["query"] not in seen:
-                    recent_unique.append(entry)
-                    seen.add(entry["query"])
-                if len(recent_unique) >= 3:
-                    break
-            
-            for entry in recent_unique:
-                short = "🔍 " + (entry["query"][:24] + "..." if len(entry["query"]) > 24 else entry["query"])
-                if st.button(short, key=f"recent_{entry['query_id']}_btn", use_container_width=True, type="tertiary"):
-                    triggered = entry["query"]
 
-        # Feedback log
-        st.markdown(
-            "<p class='sidebar-section-label'>FEEDBACK LOG</p>",
-            unsafe_allow_html=True,
-        )
-        fd = FEEDBACK_DATA
-        bars_html = "".join([
-            f"<div class='feedback-bar-row'>"
-            f"<span class='feedback-bar-label'>{k}</span>"
-            f"<div class='feedback-bar-track'><div class='feedback-bar-fill' style='width:{v}%'></div></div>"
-            f"<span class='feedback-bar-pct'>{v}%</span>"
-            f"</div>"
-            for k, v in fd["by_type"].items()
-        ])
-
-        last_query = ""
-        if history:
-            last = history[-1]
-            icon = "👍" if last.get("feedback") == "positive" else "👎"
-            short = last["query"][:22] + "..." if len(last["query"]) > 22 else last["query"]
-            last_query = f"<p style='font-size:10px; color:#888; margin:6px 0 0;'>Last: {icon} \"{short}\"</p>"
-
-        st.markdown(
-            f"""
-            <div class='feedback-log-card'>
-                <div style='display:flex; align-items:baseline; gap:6px;'>
-                    <span class='feedback-score'>{fd['score']}%</span>
-                    <span class='feedback-sub'>helpful</span>
-                </div>
-                <div style='font-size:10px; color:#888; margin-bottom:8px;'>
-                    👍 {fd['thumbs_up']} · 👎 {fd['thumbs_down']} · {fd['total']} total
-                </div>
-                {bars_html}
-                {last_query}
+        # Query count
+        count = len(st.session_state.get("chat_history", []))
+        if count > 0:
+            st.markdown(f"""
+            <div style="margin-top:16px; font-size:12px; opacity:0.6;">
+                {count} quer{'y' if count == 1 else 'ies'} this session
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            """, unsafe_allow_html=True)
 
     return triggered
 
 
-# ─────────────────────────────────────────────────────────────
-# Answer card renderer
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Use case badge
+# ══════════════════════════════════════════════════════════════════════════════
 
-def render_answer_card(result: dict) -> None:
-    """Renders the query-type badge + answer card with headline, body, impact."""
-    badge_label = result.get("query_label", "")
-    headline    = result.get("headline", "")
-    body        = result.get("body", "")
-    impact      = result.get("impact", "")
+def get_badge_html(use_case) -> str:
+    """Return coloured badge HTML for a use case."""
+    uc = use_case.value if hasattr(use_case, "value") else str(use_case)
+    config = {
+        "change_analysis": ("pi-badge-change",    "Change Analysis"),
+        "compare":         ("pi-badge-compare",   "Comparison"),
+        "breakdown":       ("pi-badge-breakdown", "Breakdown"),
+        "summarize":       ("pi-badge-summary",   "Summary"),
+        "unknown":         ("pi-badge-unknown",   "Analysis"),
+    }
+    cls, label = config.get(uc, ("pi-badge-unknown", "Analysis"))
+    return f"<span class='pi-badge {cls}'>{label}</span>"
 
-    st.markdown(
-        f"<div class='query-type-badge'>{badge_label}</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"""
-        <div class='answer-card'>
-            <p class='answer-headline'>{headline}</p>
-            <p class='answer-body'>{body}</p>
-            {"<p class='answer-impact-label'>BUSINESS IMPACT</p><p class='answer-impact-text'>" + impact + "</p>" if impact else ""}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Result renderer
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_result(entry: dict):
+    """
+    Render a complete query result including:
+    - Use case badge
+    - Headline + narrative
+    - Anomaly alerts
+    - Key facts
+    - Chart
+    - Data table
+    - Trust trail (expandable)
+    - Feedback buttons
+    """
+    result   = entry["result"]
+    query_id = entry["query_id"]
+
+    confidence_label = result.get("trust", {}).get("confidence_label", "Medium")
+    confidence_score = round(result.get("confidence", 0.0) * 100)
+
+    st.markdown("<div class='pi-card pi-answer-card'>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="pi-result-query">
+        <span>Query</span>
+        <strong style="color:#42145f;">{entry['query']}</strong>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if result.get("needs_clarification") and result.get("clarification_question"):
+        st.markdown(f"""
+        <div class='pi-clarify'>
+            <strong>Clarification:</strong> {result['clarification_question']}
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """, unsafe_allow_html=True)
 
+    # Time resolution note
+    if result.get("resolution_summary"):
+        st.markdown(f"""
+        <div style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px;
+                    padding:8px 14px; font-size:12px; color:#166534; margin-bottom:12px;">
+            {result['resolution_summary']}
+        </div>
+        """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────
-# Feedback row renderer
-# ─────────────────────────────────────────────────────────────
+    badge_html = get_badge_html(result.get("use_case", "unknown"))
+    st.markdown(badge_html, unsafe_allow_html=True)
 
-def render_feedback_row(query_id: str) -> None:
-    """Renders 'Was this helpful?' + thumbs buttons inline."""
-    fb_key = f"feedback_{query_id}"
+    if result.get("headline"):
+        st.markdown(f"<p class='pi-headline'>{result['headline']}</p>", unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="pi-result-kpis">
+        <div class="pi-mini-stat">
+            <div class="pi-mini-stat-label">Confidence</div>
+            <div class="pi-mini-stat-value">{confidence_label} · {confidence_score}%</div>
+        </div>
+        <div class="pi-mini-stat">
+            <div class="pi-mini-stat-label">Rows Returned</div>
+            <div class="pi-mini-stat-value">{result.get('row_count', 0)}</div>
+        </div>
+        <div class="pi-mini-stat">
+            <div class="pi-mini-stat-label">Query Runtime</div>
+            <div class="pi-mini-stat-value">{result.get('query_ms', 0)}ms</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    for anomaly in result.get("anomalies", []):
+        st.markdown(f"<div class='pi-anomaly'>{anomaly}</div>", unsafe_allow_html=True)
+
+    col_left, col_right = st.columns([3, 2])
+
+    with col_left:
+        st.markdown("<div class='pi-section-label'>Narrative</div>", unsafe_allow_html=True)
+
+        narrative = result.get("narrative", "")
+        if narrative:
+            lines = []
+            skip_headers = ["HEADLINE:", "DATA SOURCE:", "KEY FACTS:", "TOP CONTRIBUTORS:",
+                            "KEY DIFFERENCES:", "THIS PERIOD:", "KEY TAKEAWAY:"]
+            for line in narrative.split("\n"):
+                if not any(line.strip().startswith(h) for h in skip_headers):
+                    lines.append(line)
+            clean_narrative = "\n".join(lines).strip()
+            st.markdown(f"<p class='pi-body'>{clean_narrative}</p>", unsafe_allow_html=True)
+
+    with col_right:
+        if result.get("key_facts"):
+            st.markdown("<div class='pi-section-label'>Key Facts</div>", unsafe_allow_html=True)
+            for fact in result["key_facts"][:4]:
+                st.markdown(f"""
+                <div class='pi-fact-row'>
+                    <div class='pi-fact-dot'></div>
+                    <div>{fact}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    chart_data = result.get("chart", {})
+    if chart_data.get("data"):
+        st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
+        st.markdown("<div class='pi-section-label'>Visual Breakdown</div>", unsafe_allow_html=True)
+        render_chart(chart_data)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # Data table (collapsible)
+    if result.get("data") and result.get("columns"):
+        with st.expander(f"View raw query results ({result.get('row_count', 0)} rows · {result.get('query_ms', 0)}ms)", expanded=False):
+            df = pd.DataFrame(result["data"])
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(f"Query executed in {result.get('query_ms', 0)}ms via DuckDB")
+
+    # Trust trail
+    trust = result.get("trust", {})
+    if trust:
+        render_trust_panel(trust)
+
+    # Feedback row
+    st.markdown("<hr class='pi-divider'>", unsafe_allow_html=True)
+    col_q, col_up, col_dn, col_resp, _ = st.columns([2.5, 0.4, 0.4, 2, 4])
+    fb_key = f"fb_{query_id}"
     fb_val = st.session_state.get(fb_key)
 
-    col_label, col_up, col_down, col_confirm, _ = st.columns([2, 0.5, 0.5, 2, 4])
-
-    with col_label:
+    with col_q:
         st.markdown(
-            "<p style='margin:8px 0; font-size:13px; color:#555;'>Was this helpful?</p>",
+            "<p style='margin:6px 0; font-size:13px; color:#666;'>Was this helpful?</p>",
             unsafe_allow_html=True,
         )
     with col_up:
-        if st.button("👍", key=f"up_{query_id}"):
+        if st.button("Helpful", key=f"up_{query_id}"):
             st.session_state[fb_key] = "positive"
+            st.session_state["feedback_counts"]["positive"] += 1
             st.rerun()
-    with col_down:
-        if st.button("👎", key=f"dn_{query_id}"):
+    with col_dn:
+        if st.button("Needs work", key=f"dn_{query_id}"):
             st.session_state[fb_key] = "negative"
+            st.session_state["feedback_counts"]["negative"] += 1
             st.rerun()
-    with col_confirm:
+    with col_resp:
         if fb_val == "positive":
             st.markdown(
-                "<span style='background:#d4edda; color:#155724; border-radius:20px; "
-                "padding:4px 14px; font-size:12px; font-weight:600;'>👍 Helpful — thank you</span>",
+                "<span style='background:#d1fae5; color:#065f46; border-radius:20px;"
+                "padding:4px 14px; font-size:12px; font-weight:600;'>Marked as helpful</span>",
                 unsafe_allow_html=True,
             )
         elif fb_val == "negative":
-            # Show inline text input for "what went wrong"
             st.text_input(
                 "What went wrong?",
-                placeholder="e.g. wrong date range · metric seemed off…",
+                placeholder="e.g. wrong date range, metric seemed off…",
                 key=f"fb_note_{query_id}",
                 label_visibility="collapsed",
             )
 
 
-# ─────────────────────────────────────────────────────────────
-# Follow-up suggestions
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 1 — Analyse
+# ══════════════════════════════════════════════════════════════════════════════
 
-def render_followups(followups: list[str], result_idx: int) -> None:
-    """Renders follow-up query pill buttons at the bottom of each result."""
-    if not followups:
-        return
+def page_analyse(pipeline):
+    """Main chat/analysis page."""
 
-    cols = st.columns(len(followups))
-    for i, suggestion in enumerate(followups):
-        with cols[i]:
-            # Strip the → for the actual query
-            clean = suggestion.rstrip(" →").strip()
-            if st.button(suggestion, key=f"followup_{result_idx}_{i}"):
-                st.session_state["prefill_query"] = clean
-                st.session_state["auto_query"] = clean
-                st.rerun()
+    history = st.session_state.get("chat_history", [])
+    fb      = st.session_state.get("feedback_counts", {})
+    datasets = list_registered_datasets()
+    total_fb = fb.get("positive", 0) + fb.get("negative", 0)
+    helpful_pct = round(fb.get("positive", 0) / total_fb * 100) if total_fb > 0 else 0
 
-
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
-
-def main() -> None:
-
-    # Session state init
-    if "chat_history"  not in st.session_state: st.session_state["chat_history"]  = []
-    if "active_demo"   not in st.session_state: st.session_state["active_demo"]   = None
-    if "prefill_query" not in st.session_state: st.session_state["prefill_query"] = ""
-
-    # Navbar
-    st.markdown(
-        """
-        <div class='datatalk-navbar'>
-            <div class='datatalk-navbar-left'>
-                <svg width="32" height="32" viewBox="0 0 120 120" xmlns="http://www.w3.org/2000/svg">
-                    <rect width="120" height="120" rx="36" fill="#300d47"/>
-                    <g transform="translate(60, 56) scale(1.1)">
-                        <path d="M 0,-30 L 17,-20 L 0,-10 L -17,-20 Z" fill="#b062eb"/>
-                        <path d="M -17,-20 L 0,-10 L 0,10 L -17,0 Z" fill="#8c3bd4"/>
-                        <path d="M 0,-10 L 17,-20 L 17,0 L 0,10 Z" fill="#691da6"/>
-                        <path d="M -19,4 L -2,-6 L -19,-16 L -36,-6 Z" fill="#b062eb"/>
-                        <path d="M -36,-6 L -19,4 L -19,24 L -36,14 Z" fill="#8c3bd4"/>
-                        <path d="M -19,4 L -2,-6 L -2,14 L -19,24 Z" fill="#691da6"/>
-                        <path d="M 19,4 L 36,-6 L 19,-16 L 2,-6 Z" fill="#b062eb"/>
-                        <path d="M 2,-6 L 19,4 L 19,24 L 2,14 Z" fill="#8c3bd4"/>
-                        <path d="M 19,4 L 36,-6 L 36,14 L 19,24 Z" fill="#691da6"/>
-                    </g>
-                </svg>
-                <span class='datatalk-logo-text'>PurpleInsight</span>
-            </div>
-            <div class='datatalk-navbar-right'>
-                <span class='datatalk-tagline'>Self-service banking intelligence</span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    llm_status = get_llm_runtime_status()
+    pipeline_status = "Ready" if pipeline else "Needs attention"
+    pipeline_detail = (
+        f"{llm_status['provider']} · {llm_status['model']}" if pipeline
+        else get_pipeline_issue(pipeline)
     )
 
-    # Sidebar
-    demo_triggered = render_sidebar(st.session_state.get("active_demo"))
-    if demo_triggered:
-        st.session_state["prefill_query"] = demo_triggered
-        st.session_state["auto_query"] = demo_triggered
-        st.rerun()
+    st.markdown(f"""
+    <div class="pi-hero">
+        <div class="pi-eyebrow">Self-service banking intelligence</div>
+        <div class="pi-hero-title">Ask a business question. Get a clear answer, the chart, and the trust trail in one place.</div>
+        <div class="pi-hero-subtitle">
+            PurpleInsight turns natural-language questions into trusted analytics across registered business datasets, with clear answers, transparent sources, and a governed trust trail.
+        </div>
+        <div class="pi-hero-meta">
+            <div class="pi-hero-pill">Pipeline: {pipeline_status}</div>
+            <div class="pi-hero-pill">Provider: {llm_status['provider']}</div>
+            <div class="pi-hero-pill">{pipeline_detail}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Query input bar
-    main_query = render_query_input()
-    
-    auto_query = st.session_state.pop("auto_query", None)
-    query = auto_query or main_query
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f"""
+        <div class='pi-stat'>
+            <div class='pi-stat-value'>{len(history)}</div>
+            <div class='pi-stat-label'>Queries this session</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class='pi-stat'>
+            <div class='pi-stat-value'>{len(datasets)}</div>
+            <div class='pi-stat-label'>Datasets loaded</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""
+        <div class='pi-stat'>
+            <div class='pi-stat-value'>
+                {helpful_pct}%
+            </div>
+            <div class='pi-stat-label'>Helpfulness score</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"""
+        <div class='pi-stat'>
+            <div class='pi-stat-value'>{"Ready" if pipeline else "Review"}</div>
+            <div class='pi-stat-label'>Pipeline status</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    # Process query
-    if query:
-        # Detect which mock result to use based on keywords in the query text
-        query_lower = query.lower()
-        if any(w in query_lower for w in ["breakdown", "product", "contributes", "makes up"]):
-            result = MOCK_RESULTS["Breakdown"]
-            st.session_state["active_demo"] = "Breakdown"
-        elif any(w in query_lower for w in ["compare", "vs", "north", "south", "region"]):
-            result = MOCK_RESULTS["Comparison"]
-            st.session_state["active_demo"] = "Comparison"
-        elif any(w in query_lower for w in ["why", "drop", "fell", "change", "cause"]):
-            result = MOCK_RESULTS["Change analysis"]
-            st.session_state["active_demo"] = "Change analysis"
+    st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
+    query = render_query_input()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # Auto-submit from demo buttons or follow-ups
+    auto = st.session_state.pop("auto_query", None)
+    final_query = auto or query
+
+    if final_query and final_query.strip():
+        if not pipeline:
+            st.error(
+                "Pipeline not available. "
+                f"{get_pipeline_issue(pipeline)} "
+                "Also make sure the required dependencies are installed."
+            )
         else:
-            result = MOCK_RESULTS["Summary"]
-            st.session_state["active_demo"] = "Summary"
+            with st.spinner("Analysing your question..."):
+                result = run_pipeline(final_query.strip(), pipeline)
 
-        with st.spinner("Analysing…"):
-            time.sleep(0.5)
+            entry = {
+                "query":    final_query.strip(),
+                "result":   result,
+                "query_id": str(uuid.uuid4())[:8],
+            }
+            st.session_state["chat_history"].append(entry)
 
-        entry = {
-            "query":    query,
-            "result":   result,
-            "query_id": str(uuid.uuid4())[:8],
-        }
-        st.session_state["chat_history"].append(entry)
-
-    # Render results — only the most recent one to refresh the main panel
     history = st.session_state.get("chat_history", [])
 
     if not history:
-        st.markdown(
-            "<div style='text-align:center; color:#bbb; padding:80px 0; font-size:15px;'>"
-            "Select a demo query on the left, or type your own question above."
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("""
+        <div class='pi-card pi-empty'>
+            <div class='pi-empty-icon'>Data</div>
+            <div class='pi-empty-title'>Your analysis workspace is ready</div>
+            <div class='pi-empty-sub'>
+                Start with a query above or use one of the guided examples to see the full flow.<br>
+                <span style="color:#b39bd1; margin-top:6px; display:block;">
+                    Revenue drivers · Region comparisons · Department cost breakdowns · Weekly KPI summaries
+                </span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
         return
 
-    latest_entry = history[-1]
-    result   = latest_entry["result"]
-    query_id = latest_entry.get("query_id", "q_curr")
+    latest = history[-1]
+    render_result(latest)
 
-    # Answer card
-    render_answer_card(result)
+    if len(history) > 1:
+        with st.expander(f"Recent Query History ({len(history)-1})", expanded=False):
+            st.markdown("<div class='pi-card pi-history-card'>", unsafe_allow_html=True)
+            for entry in reversed(history[:-1]):
+                st.markdown(f"""
+                <div class="pi-history-item">
+                    <div class="pi-history-title">{entry['query']}</div>
+                    <div class="pi-history-meta">Use case: {getattr(entry['result'].get('use_case'), 'value', 'analysis')} · Runtime: {entry['result'].get('query_ms', 0)}ms</div>
+                </div>
+                """, unsafe_allow_html=True)
 
-    # Feedback row
-    st.markdown("<div style='border:1px solid #e8e0f0; border-radius:8px; padding:8px 16px; margin-bottom:14px; background:white;'>", unsafe_allow_html=True)
-    render_feedback_row(query_id)
+                if st.button(
+                    "Re-run this query",
+                    key=f"rerun_{entry['query_id']}",
+                    type="secondary",
+                ):
+                    st.session_state["auto_query"] = entry["query"]
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 — How It Works
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_how_it_works():
+    """Explains the system architecture for non-technical users and judges."""
+
+    st.markdown("""
+    <div class='pi-card-purple'>
+        <div style="font-size:22px; font-weight:800; color:#42145f; margin-bottom:6px;">
+            How PurpleInsight Works
+        </div>
+        <div style="font-size:14px; color:#6b3fa0; line-height:1.6;">
+            PurpleInsight removes friction between non-technical users and their data.
+            Ask a question in plain English — get a trusted, verified answer in seconds.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # 3 pillars
+    st.markdown("### The Three Pillars")
+    c1, c2, c3 = st.columns(3)
+    pillars = [
+        ("1", "Clarity", "Answers in plain English. No SQL. No jargon. No data science degree required."),
+        ("2", "Trust", "Every answer shows the SQL that ran, which metrics were used, and the data source. Nothing is hidden."),
+        ("3", "Speed", "DuckDB executes queries in milliseconds. Groq-powered Llama generates answers in under 2 seconds."),
+    ]
+    for col, (num, title, desc) in zip([c1, c2, c3], pillars):
+        with col:
+            st.markdown(f"""
+            <div class='hiw-step'>
+                <div class='hiw-step-number'>{num}</div>
+                <div class='hiw-step-title'>{title}</div>
+                <div class='hiw-step-body'>{desc}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Pipeline steps
+    st.markdown("### The AI Pipeline — Step by Step")
+
+    steps = [
+        ("1", "Ambiguity Handler",
+         "Detects vague time references like 'last month' or 'this week' and resolves them to exact dates before anything else happens. You never get a wrong date range.",
+         "Pure Python · python-dateutil · zero API cost"),
+
+        ("2", "Intent Router",
+         "Classifies your question into one of 4 use cases: Change Analysis, Comparison, Breakdown, or Summary. Uses local sentence-transformer embeddings — fast and free, no API call needed.",
+         "sentence-transformers · all-MiniLM-L6-v2 · runs locally"),
+
+        ("3", "Metric Dictionary",
+         "Every query is resolved through a YAML metric dictionary before hitting the LLM. This ensures 'revenue' always means the same thing across all queries, teams, and time periods — a NatWest requirement.",
+         "metrics.yaml · 20+ metric definitions · canonical NatWest terms"),
+
+        ("4", "NL to SQL (Groq)",
+         "Groq-hosted Llama converts your natural language question into a valid DuckDB SQL query, using the metric definitions and table schemas injected into the prompt. Only SELECT queries are allowed.",
+         "Llama 3.1 70B · DuckDB SQL · schema-aware prompting"),
+
+        ("5", "Query Engine",
+         "DuckDB executes the SQL directly against the CSV datasets in memory. No database server. No cloud. Raw rows are never returned — only aggregates. Results are validated before leaving this layer.",
+         "DuckDB in-memory · MAX 50 rows · aggregates only"),
+
+        ("6", "Narrative (Groq)",
+         "Groq-hosted Llama converts the query results into a clear, plain-English answer using use-case-specific templates. The output matches the exact format from the NatWest problem document.",
+         "Llama 3.1 70B · 4 narrative templates · anomaly detection"),
+
+        ("7", "Trust Trail",
+         "Every answer is wrapped in a full trust trail showing: the SQL executed, metric definitions applied, dataset used, confidence level, and whether any raw data was exposed (never).",
+         "Built in-app · no external dependency · judge-visible"),
+    ]
+
+    for num, title, desc, tech in steps:
+        with st.expander(f"Step {num} — {title}", expanded=(num == "1")):
+            col_desc, col_tech = st.columns([3, 1])
+            with col_desc:
+                st.markdown(f"<p style='font-size:14px; color:#444; line-height:1.6;'>{desc}</p>", unsafe_allow_html=True)
+            with col_tech:
+                st.markdown(f"""
+                <div style="background:#f5f0fb; border-radius:8px; padding:10px 12px;
+                            font-size:11px; color:#6b3fa0; font-family:monospace; line-height:1.6;">
+                    {tech}
+                </div>
+                """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # 4 use cases
+    st.markdown("### The 4 Use Cases")
+    use_cases = [
+        ("1", "Change Analysis", "Why did revenue drop last month?",
+         "Revenue decreased by 20.5% in Feb 2024. The biggest contributor was a 27.6% drop in the South region coinciding with a churn spike from 5.3% to 9.1%."),
+        ("2", "Comparison", "Compare North vs South region revenue",
+         "North outperforms South by £3.1M (+26.6%) in H1 2024. South was severely impacted in Feb–Apr where revenue fell 27.6%."),
+        ("3", "Breakdown", "Show the breakdown of costs by department",
+         "Technology accounts for 32% of total costs at £25.9M, followed by Operations at 24%. Combined they represent over half of total spend."),
+        ("4", "Summary", "Give me a weekly summary of customer metrics",
+         "This week: Signups grew by 5%, churn remained stable at 1.8%, NPS improved to 44, and average handle time decreased by 12 seconds."),
+    ]
+
+    for order, title, query_ex, output_ex in use_cases:
+        st.markdown(f"""
+        <div class='pi-card' style='margin-bottom:10px;'>
+            <div style='font-size:15px; font-weight:700; color:#42145f; margin-bottom:8px;'>
+                Use Case {order} · {title}
+            </div>
+            <div style='display:flex; gap:16px; flex-wrap:wrap;'>
+                <div style='flex:1; min-width:200px;'>
+                    <div style='font-size:10px; font-weight:800; letter-spacing:0.1em;
+                                color:#9a9aaa; text-transform:uppercase; margin-bottom:4px;'>
+                        Example Query
+                    </div>
+                    <div style='background:#f5f0fb; border-radius:6px; padding:8px 12px;
+                                font-size:13px; color:#42145f; font-style:italic;'>
+                        "{query_ex}"
+                    </div>
+                </div>
+                <div style='flex:2; min-width:250px;'>
+                    <div style='font-size:10px; font-weight:800; letter-spacing:0.1em;
+                                color:#9a9aaa; text-transform:uppercase; margin-bottom:4px;'>
+                        Example Output
+                    </div>
+                    <div style='background:#f0fdf4; border-radius:6px; padding:8px 12px;
+                                font-size:13px; color:#166534;'>
+                        {output_ex}
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Security note
+    st.markdown("### Security & Data Privacy")
+    st.markdown("""
+    <div class='pi-card' style='border-left:4px solid #42145f;'>
+        <div style='font-size:14px; color:#444; line-height:1.65;'>
+            <strong>No raw data is ever exposed by design.</strong>
+            The query engine is intended to return aggregated results for decision support, while the trust layer surfaces data sources and executed SQL.
+            The bundled demo datasets are synthetic and suitable for hackathon presentation.
+            Any uploaded datasets remain local to this workspace.
+            API keys are stored in <code>.env</code> and never committed to GitHub.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — Data Explorer
+# ══════════════════════════════════════════════════════════════════════════════
+
+def page_data_explorer():
+    """Browse registered datasets directly."""
+
+    st.markdown("""
+    <div class='pi-card-purple'>
+        <div style="font-size:20px; font-weight:800; color:#42145f; margin-bottom:4px;">
+            Data Explorer
+        </div>
+        <div style="font-size:13px; color:#6b3fa0;">
+            Browse the registered datasets powering PurpleInsight.
+            The bundled demo datasets are generated by <code>scripts/generate_synthetic_data.py</code>.
+            Newly added datasets are registered locally and remain inside this workspace.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    datasets = list_registered_datasets()
+
+    if not datasets:
+        st.warning("No datasets are registered yet. Add one in the Dataset Registry page first.")
+        return
+
+    selected = st.selectbox(
+        "Select a dataset to explore",
+        options=[item["dataset_id"] for item in datasets],
+        format_func=lambda dataset_id: next(
+            item["display_name"] for item in datasets if item["dataset_id"] == dataset_id
+        ),
+    )
+
+    selected_dataset = next(item for item in datasets if item["dataset_id"] == selected)
+    title = selected_dataset["display_name"]
+    desc = selected_dataset["description"]
+    use_cases = ", ".join(selected_dataset["primary_use_cases"])
+    filepath = selected_dataset["file_path"]
+
+    if os.path.exists(filepath):
+        df = pd.read_csv(filepath)
+
+        # Dataset header
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.markdown(f"""
+            <div class='pi-stat'>
+                <div class='pi-stat-value'>{len(df):,}</div>
+                <div class='pi-stat-label'>Total rows</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_b:
+            st.markdown(f"""
+            <div class='pi-stat'>
+                <div class='pi-stat-value'>{len(df.columns)}</div>
+                <div class='pi-stat-label'>Columns</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_c:
+            st.markdown(f"""
+            <div class='pi-stat'>
+                <div class='pi-stat-value'>{df.isnull().sum().sum()}</div>
+                <div class='pi-stat-label'>Null values</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div style='font-size:13px; color:#666; margin:12px 0 16px;'>
+            {desc} · Used for: <strong style='color:#42145f;'>{use_cases}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Preview
+        st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='pi-table-header'>Preview — {title}</div>", unsafe_allow_html=True)
+        st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # Column schema
+        with st.expander("Column schema", expanded=False):
+            schema_data = []
+            for col in df.columns:
+                schema_data.append({
+                    "Column":   col,
+                    "Type":     str(df[col].dtype),
+                    "Non-null": df[col].count(),
+                    "Unique":   df[col].nunique(),
+                    "Sample":   str(df[col].iloc[0]) if len(df) > 0 else "",
+                })
+            st.dataframe(pd.DataFrame(schema_data), use_container_width=True, hide_index=True)
+
+        # Numeric stats
+        numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns
+        if len(numeric_cols) > 0:
+            with st.expander("Numeric statistics", expanded=False):
+                st.dataframe(
+                    df[numeric_cols].describe().round(2),
+                    use_container_width=True,
+                )
+    else:
+        st.error(f"File not found: {filepath}")
+
+
+def page_dataset_registry():
+    """Upload and register datasets in one central place."""
+    st.markdown("""
+    <div class='pi-card-purple'>
+        <div style="font-size:20px; font-weight:800; color:#42145f; margin-bottom:4px;">
+            Dataset Registry
+        </div>
+        <div style="font-size:13px; color:#6b3fa0;">
+            Add new datasets in one dedicated place. Files are stored in <code>data/raw</code> and metadata is written to <code>config/datasets.yaml</code>.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    datasets = list_registered_datasets()
+
+    st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='pi-panel-title'>Registered Datasets</div>", unsafe_allow_html=True)
+    registry_rows = [
+        {
+            "Dataset ID": item["dataset_id"],
+            "Display Name": item["display_name"],
+            "Category": item["category"],
+            "File": item["file"],
+            "Available": "Yes" if item["exists"] else "No",
+            "Use Cases": ", ".join(item["primary_use_cases"]),
+        }
+        for item in datasets
+    ]
+    st.dataframe(pd.DataFrame(registry_rows), use_container_width=True, hide_index=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Chart + table
-    st.markdown("<div style='border:1px solid #e8e0f0; border-radius:8px; padding:12px 14px; background:white; margin-bottom:14px;'>", unsafe_allow_html=True)
-    render_chart(result.get("chart", {}))
+    st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='pi-panel-title'>Add Dataset</div>", unsafe_allow_html=True)
+    st.markdown("<div class='pi-panel-subtitle'>Upload a CSV, register it centrally, and make it available to the explorer and AI query pipeline.</div>", unsafe_allow_html=True)
+
+    with st.form("dataset_registry_form", clear_on_submit=True):
+        uploaded_file = st.file_uploader("CSV file", type=["csv"])
+        display_name = st.text_input("Display name", placeholder="Example: Branch Service Quality")
+        description = st.text_area("Description", placeholder="What the dataset contains and how it should be used.")
+        category = st.selectbox("Category", ["Revenue", "Customer", "Product", "Cost", "KPI", "Operations", "General"])
+        use_cases = st.multiselect(
+            "Primary use cases",
+            ["change_analysis", "compare", "breakdown", "summarize"],
+            default=["summarize"],
+        )
+        submitted = st.form_submit_button("Save dataset", type="primary")
+
+    if uploaded_file is not None:
+        preview_df = pd.read_csv(uploaded_file, nrows=5)
+        st.markdown("<div class='pi-section-label'>Preview</div>", unsafe_allow_html=True)
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    if submitted:
+        if not uploaded_file or not display_name.strip() or not description.strip() or not use_cases:
+            st.error("Please provide the CSV file, display name, description, and at least one use case.")
+        else:
+            dataset_id = slugify_dataset_id(display_name)
+            raw_dir = os.path.join(ROOT, "data", "raw")
+            os.makedirs(raw_dir, exist_ok=True)
+            safe_file_name = f"{dataset_id}.csv"
+            file_path = os.path.join(raw_dir, safe_file_name)
+            with open(file_path, "wb") as handle:
+                handle.write(uploaded_file.getbuffer())
+            register_dataset(
+                dataset_id=dataset_id,
+                display_name=display_name.strip(),
+                description=description.strip(),
+                category=category,
+                file_name=safe_file_name,
+                primary_use_cases=use_cases,
+            )
+            st.success(f"Dataset '{display_name.strip()}' has been added to the registry.")
+            st.rerun()
+
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Trust panel (collapsible bar)
-    render_trust_panel(result.get("trust", {}))
 
-    # Follow-up suggestions
-    st.markdown("")
-    render_followups(result.get("followups", []), len(history)-1)
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
 
-    st.markdown("<hr style='border:none; border-top:1px solid #f0e8f8; margin:24px 0;'>", unsafe_allow_html=True)
+def main():
+    """Main app entry point."""
+    init_session()
+    pipeline = load_pipeline()
+
+    # Handle sidebar navigation + demo triggers
+    demo_triggered = render_sidebar(pipeline)
+    if demo_triggered:
+        st.session_state["auto_query"] = demo_triggered
+        st.session_state["page"] = "Analyse"
+        st.rerun()
+
+    # Navbar
+    render_navbar()
+
+    # Page routing
+    page = st.session_state.get("page", "Analyse")
+
+    if page == "Analyse":
+        page_analyse(pipeline)
+    elif page == "How It Works":
+        page_how_it_works()
+    elif page == "Data Explorer":
+        page_data_explorer()
+    elif page == "Dataset Registry":
+        page_dataset_registry()
 
 
 if __name__ == "__main__":
