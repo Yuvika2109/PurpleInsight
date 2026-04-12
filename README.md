@@ -204,53 +204,10 @@ curl -X POST http://localhost:8000/feedback \
 
 ## Architecture
 
-```
-User Query (plain English)
-        │
-        ▼
-┌─────────────────────┐
-│  Ambiguity Handler  │  Resolves vague time refs → concrete date filters
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│   Intent Router     │  Keyword + semantic matching → CHANGE / COMPARE / BREAKDOWN / SUMMARIZE
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│  Dataset Selector   │  Ranks relevant datasets from the central registry
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│   NL → SQL (Groq)   │  Metric-aware prompting with schema context + use-case template
-│   + Local Fallback  │  Falls back to deterministic SQL if LLM unavailable
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│   DuckDB Engine     │  In-memory SQL execution · SELECT only · 50-row cap · no raw PII
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│ Narrative Generator │  SQL result → plain English explanation (Groq + local fallback)
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│   Trust Builder     │  Attaches SQL · metrics used · confidence · source · feedback slot
-└─────────────────────┘
-        │
-        ▼
-┌─────────────────────┐
-│  Chart Selector     │  Picks Plotly chart type based on intent and result shape
-└─────────────────────┘
-        │
-        ▼
-   Answer + Chart + Trust Trail → Streamlit UI / FastAPI response
-```
+
+<img width="403" height="893" alt="image" src="https://github.com/user-attachments/assets/a960deb2-18bb-488b-91bb-84d6fae5bdbf" />
+
+
 
 ---
 
