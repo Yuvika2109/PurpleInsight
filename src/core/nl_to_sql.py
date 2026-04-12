@@ -19,18 +19,18 @@ Security:
 
 import os
 import re
+from urllib import response
 import yaml
 from loguru import logger
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 
 from src.core.intent_router import UseCase
 
 load_dotenv()
 
 # ── Gemini setup ──────────────────────────────────────────────────────────────
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-_MODEL = genai.GenerativeModel("gemini-1.5-flash")
+_CLIENT = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ── Dataset schemas — what DuckDB can query ───────────────────────────────────
 DATASET_SCHEMAS = {
@@ -382,9 +382,9 @@ SQL:"""
 
         for attempt in range(max_retries + 1):
             try:
-                response  = _MODEL.generate_content(prompt)
-                raw_sql   = response.text
-                clean_sql = self._clean_sql(raw_sql)
+                
+                response = _CLIENT.models.generate_content(model="gemini-2.0-flash-lite", contents=prompt)
+                raw_sql = response.text
 
                 is_valid, error = self._validate_sql(clean_sql)
 
