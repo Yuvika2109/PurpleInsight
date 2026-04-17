@@ -5,35 +5,43 @@ datasets:
     description: Monthly revenue by region, product, and channel
     category: Revenue
     primary_use_cases:
-      - change_analysis
-      - compare
+    - change_analysis
+    - compare
   customer_metrics:
     file: customer_metrics.csv
     display_name: Customer Metrics
     description: Monthly signups, churn, complaints, and NPS by segment and region
     category: Customer
     primary_use_cases:
-      - change_analysis
-      - summarize
+    - change_analysis
+    - summarize
   product_performance:
     file: product_performance.csv
     display_name: Product Performance
     description: Weekly product metrics including volume, revenue, and return rate
     category: Product
     primary_use_cases:
-      - compare
-      - breakdown
+    - compare
+    - breakdown
   cost_breakdown:
     file: cost_breakdown.csv
     display_name: Cost Breakdown
     description: Quarterly cost breakdown by department and cost category
     category: Cost
     primary_use_cases:
-      - breakdown
+    - breakdown
   weekly_kpis:
     file: weekly_kpis.csv
     display_name: Weekly KPIs
-    description: Weekly KPI digest across acquisition, churn, revenue, and service metrics
+    description: Weekly KPI digest across acquisition, churn, revenue, and service
+      metrics
     category: KPI
     primary_use_cases:
-      - summarize
+    - summarize
+  customer:
+    file: customer.csv
+    display_name: Customer
+    description: geeta
+    category: Customer
+    primary_use_cases:
+    - summarize

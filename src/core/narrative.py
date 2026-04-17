@@ -24,8 +24,7 @@ load_dotenv()
 
 # ── Groq client ───────────────────────────────────────────────────────────────
 _CLIENT = Groq(api_key=os.getenv("GROQ_API_KEY"))
-_MODEL  = "mixtral-8x7b-32768"
-
+_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 # ── Narrative templates per use case ─────────────────────────────────────────
 NARRATIVE_TEMPLATES = {
     UseCase.CHANGE_ANALYSIS: """You are a NatWest banking analyst explaining data to a non-technical audience.
