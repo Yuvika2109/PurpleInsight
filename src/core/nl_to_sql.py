@@ -513,10 +513,13 @@ SELECT"""
             with open(self.metrics_yaml_path, "r") as f:
                 data = yaml.safe_load(f)
             sql_lower = sql.lower()
-            return [
-                defn["display_name"]
-                for defn in data.get("metrics", {}).values()
-                if defn.get("column", "").lower() in sql_lower
-            ]
+            matched = []
+            for defn in data.get("metrics", {}).values():
+                col = defn.get("column", "").lower()
+                # Also check common variant names (e.g. avg_handle_time vs avg_handle_time_secs)
+                aliases = [col, col.replace("_secs", ""), col + "_secs"]
+                if any(a and a in sql_lower for a in aliases):
+                    matched.append(defn["display_name"])
+            return matched
         except Exception:
             return []

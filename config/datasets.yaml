@@ -38,10 +38,3 @@ datasets:
     category: KPI
     primary_use_cases:
     - summarize
-  customer:
-    file: customer.csv
-    display_name: Customer
-    description: geeta
-    category: Customer
-    primary_use_cases:
-    - summarize

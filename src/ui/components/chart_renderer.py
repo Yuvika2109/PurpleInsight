@@ -78,9 +78,13 @@ def _render_change_chart(df: pd.DataFrame):
     if df.empty:
         return
 
-    # Find date column and value column
-    date_col  = _find_col(df, ["month", "week", "date", "period"])
-    value_col = _find_numeric_col(df, ["revenue", "amount", "value", "count", "total"])
+    date_col  = _find_col(df, ["month", "week", "date", "period", "quarter", "year"])
+    value_col = _find_numeric_col(df, ["revenue", "amount", "value", "count", "total", "rate", "score"])
+
+    if not date_col:
+        date_col = _find_col(df, [])
+    if not value_col:
+        value_col = _find_numeric_col(df, [])
 
     if not date_col or not value_col:
         _render_default_chart(df)
@@ -115,10 +119,11 @@ def _render_compare_chart(df: pd.DataFrame):
     if df.empty:
         return
 
-    # Try to find category and value columns
-    cat_col   = _find_col(df, ["region", "product", "segment", "channel", "department", "category"])
+    cat_col    = _find_col(df, ["region", "product", "segment", "channel", "department", "category", "name", "type"])
     value_cols = [c for c in df.select_dtypes(include=["float64", "int64"]).columns]
 
+    if not cat_col:
+        cat_col = _find_col(df, [])
     if not cat_col or not value_cols:
         _render_default_chart(df)
         return
@@ -151,9 +156,13 @@ def _render_breakdown_chart(df: pd.DataFrame):
     if df.empty:
         return
 
-    cat_col   = _find_col(df, ["department", "region", "product", "segment", "channel", "category", "cost_category"])
-    value_col = _find_numeric_col(df, ["total", "cost", "revenue", "amount", "value", "sum"])
+    cat_col   = _find_col(df, ["department", "region", "product", "segment", "channel", "category", "cost_category", "name", "type"])
+    value_col = _find_numeric_col(df, ["total", "cost", "revenue", "amount", "value", "sum", "count", "rate"])
 
+    if not cat_col:
+        cat_col = _find_col(df, [])
+    if not value_col:
+        value_col = _find_numeric_col(df, [])
     if not cat_col or not value_col:
         _render_default_chart(df)
         return
@@ -198,9 +207,11 @@ def _render_summary_chart(df: pd.DataFrame):
     if df.empty:
         return
 
-    date_col     = _find_col(df, ["week", "month", "date", "period"])
+    date_col     = _find_col(df, ["week", "month", "date", "period", "quarter", "year"])
     numeric_cols = list(df.select_dtypes(include=["float64", "int64"]).columns)
 
+    if not date_col:
+        date_col = _find_col(df, [])
     if not date_col or not numeric_cols:
         _render_default_chart(df)
         return
@@ -230,23 +241,40 @@ def _render_summary_chart(df: pd.DataFrame):
 
 
 def _render_default_chart(df: pd.DataFrame):
-    """Default bar chart fallback for any query type."""
+    """Default bar chart fallback — always renders something meaningful."""
     if df.empty:
         return
 
     cat_col   = None
     value_col = None
 
-    # Find first text column as category
     for col in df.columns:
         if df[col].dtype == "object":
             cat_col = col
             break
 
-    # Find first numeric column as value
     for col in df.select_dtypes(include=["float64", "int64"]).columns:
         value_col = col
         break
+
+    # All-numeric result (e.g. aggregated single row) — transpose and show metric names as bars
+    if not cat_col and value_col:
+        numeric_cols = list(df.select_dtypes(include=["float64", "int64"]).columns)
+        if numeric_cols:
+            row = df[numeric_cols].iloc[0] if len(df) == 1 else df[numeric_cols].mean()
+            labels = [c.replace("_", " ").title() for c in numeric_cols]
+            fig = go.Figure(go.Bar(
+                x            = labels,
+                y            = row.values,
+                marker_color = PURPLE_DEEP,
+                text         = [f"{v:,.1f}" for v in row.values],
+                textposition = "outside",
+            ))
+            layout = dict(**PLOTLY_LAYOUT)
+            layout["title"] = dict(text="Metric Overview", font=dict(size=13, color="#3d3d4a"), x=0, xanchor="left")
+            fig.update_layout(**layout)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            return
 
     if not cat_col or not value_col:
         st.dataframe(df.head(10), use_container_width=True, hide_index=True)
@@ -257,7 +285,9 @@ def _render_default_chart(df: pd.DataFrame):
         x     = cat_col,
         y     = value_col,
         color_discrete_sequence = [PURPLE_DEEP],
+        text  = value_col,
     )
+    fig.update_traces(texttemplate="%{text:,.1f}", textposition="outside")
     layout = dict(**PLOTLY_LAYOUT)
     fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})

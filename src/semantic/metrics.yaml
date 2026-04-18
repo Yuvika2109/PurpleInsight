@@ -289,8 +289,8 @@ metrics:
       Measured from call/chat start to resolution including after-call work.
       UK banking call centre benchmark: approximately 340 seconds.
       Lower is better (indicates efficiency improvement).
-    column: "avg_handle_time_secs"
-    datasets: ["weekly_kpis"]
+    column: "avg_handle_time"
+    datasets: ["customer_metrics", "weekly_kpis"]
     aggregation: "AVG"
     unit: "seconds"
     format: "number"

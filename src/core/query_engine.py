@@ -94,10 +94,9 @@ class QueryEngine:
         if loaded:
             logger.info(f"Loaded datasets: {', '.join(loaded)}")
         if failed:
-            logger.error(f"Failed to load: {', '.join(failed)}")
-            raise FileNotFoundError(
-                f"Missing datasets: {failed}. "
-                f"Run: python scripts/generate_synthetic_data.py"
+            logger.warning(
+                f"Skipped missing dataset files: {', '.join(failed)}. "
+                f"These datasets will not be queryable until their CSV files exist."
             )
 
         self._loaded = True
@@ -231,6 +230,24 @@ class QueryEngine:
         except Exception as e:
             logger.error(f"Sample query failed for {table_name}: {e}")
             return []
+
+    def register_new_dataset(self, dataset_id: str, file_path: str) -> bool:
+        """Create a DuckDB view for a newly registered dataset without full reload."""
+        if not os.path.exists(file_path):
+            logger.error(f"Cannot register dataset — file not found: {file_path}")
+            return False
+        conn = self._get_connection()
+        try:
+            conn.execute(f"""
+                CREATE OR REPLACE VIEW {dataset_id} AS
+                SELECT * FROM read_csv_auto('{file_path}')
+            """)
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {dataset_id}").fetchone()[0]
+            logger.info(f"Registered new dataset view: {dataset_id} ({row_count:,} rows)")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to register dataset view {dataset_id}: {e}")
+            return False
 
     def close(self):
         """Close the DuckDB connection cleanly."""

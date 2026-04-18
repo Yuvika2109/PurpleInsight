@@ -20,15 +20,17 @@ import base64
 import uuid
 import time
 
+# ── Path setup — must come before any project imports ─────────────────────────
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
-from config.dataset_registry import list_registered_datasets, register_dataset, slugify_dataset_id
-
-# ── Path setup ────────────────────────────────────────────────────────────────
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-sys.path.insert(0, ROOT)
 load_dotenv(os.path.join(ROOT, ".env"))
+
+from config.dataset_registry import list_registered_datasets, register_dataset, slugify_dataset_id
 
 # ── Core pipeline imports ──────────────────────────────────────────────────────
 try:
@@ -723,12 +725,11 @@ def load_pipeline():
 def init_session():
     """Initialise all session state keys on first load."""
     defaults = {
-        "chat_history":    [],
-        "active_demo":     None,
-        "prefill_query":   "",
-        "auto_submit":     False,
-        "page":            "Analyse",
-        "feedback_counts": {"positive": 0, "negative": 0},
+        "chat_history":       [],
+        "page":               "How It Works",
+        "feedback_counts":    {"positive": 0, "negative": 0},
+        "newly_registered":   None,
+        "selected_dataset":   None,   # dataset user explicitly picks in Analyse
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -739,7 +740,24 @@ def init_session():
 # Pipeline runner
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_pipeline(query: str, pipeline: dict) -> dict:
+def _build_confidence_reason(confidence: float, ambiguity_result, query_result: dict, sql_result: dict) -> str:
+    """Return a human-readable explanation of the confidence score."""
+    ambiguity_flags = getattr(ambiguity_result, "detected_terms", [])
+    if ambiguity_flags:
+        return f"Ambiguous terms detected ({', '.join(ambiguity_flags)}) — results may vary by interpretation."
+    if not query_result.get("success") or query_result.get("row_count", 0) == 0:
+        return "Query returned no rows — filters may be too narrow or the data may not cover this period."
+    sql = sql_result.get("sql", "").lower()
+    if "like '%" in sql or 'like "%' in sql:
+        return "SQL uses a wildcard match (LIKE) which may produce approximate results."
+    if not sql_result.get("metric_definitions"):
+        return "No registered metric definitions were matched — answer is based on raw column names."
+    if confidence > 0.7:
+        return "All metric terms resolved via the semantic dictionary with no ambiguity detected."
+    return "Intent classified with moderate confidence — the SQL and answer should be reviewed."
+
+
+def run_pipeline(query: str, pipeline: dict, forced_dataset: str = None) -> dict:
     """
     Run the full PurpleInsight pipeline for a user query.
 
@@ -767,6 +785,9 @@ def run_pipeline(query: str, pipeline: dict) -> dict:
     # Step 2 — intent classification
     intent_result = pipeline["router"].classify(query)
     datasets      = pipeline["router"].get_dataset_hint(intent_result, query)
+    # If user explicitly selected a dataset, put it first
+    if forced_dataset:
+        datasets = [forced_dataset] + [d for d in datasets if d != forced_dataset]
 
     # Step 3 — NL to SQL
     resolved_time = list(time_hints.values())[0] if time_hints else None
@@ -833,7 +854,16 @@ def run_pipeline(query: str, pipeline: dict) -> dict:
             "metric_definitions": sql_result.get("metric_definitions", []),
             "confidence":         intent_result.confidence,
             "confidence_label":   "High" if intent_result.confidence > 0.7 else "Medium" if intent_result.confidence > 0.45 else "Low",
+            "confidence_reason":  _build_confidence_reason(
+                intent_result.confidence,
+                ambiguity_result,
+                query_result,
+                sql_result,
+            ),
+            "use_case_value":     intent_result.use_case.value,
             "intent_method":      intent_result.method,
+            "matched_keywords":   intent_result.matched_keywords,
+            "ambiguity_flags":    getattr(ambiguity_result, "detected_terms", []),
             "raw_data_exposed":   False,
             "resolution_summary": resolution_summary,
             "execution_ms":       query_result.get("execution_time_ms", 0),
@@ -876,108 +906,71 @@ def render_navbar():
 # Sidebar
 # ══════════════════════════════════════════════════════════════════════════════
 
-def render_sidebar(pipeline) -> str | None:
-    """
-    Render the full sidebar with navigation, demo queries, and metrics glossary.
-
-    Returns:
-        str | None: Demo query string if a demo button was clicked
-    """
-    triggered = None
-    llm_status = get_llm_runtime_status()
+def render_sidebar(pipeline):
+    """Render the sidebar: brand, navigation, dataset list, system status."""
+    llm_status    = get_llm_runtime_status()
     pipeline_issue = get_pipeline_issue(pipeline)
 
     with st.sidebar:
         logo_data_uri = get_natwest_logo_data_uri()
-        # Logo + brand
         st.markdown(f"""
-        <div style="padding: 4px 0 20px;">
-            <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
-                <img src="{logo_data_uri}" alt="NatWest logo" style="width:34px; height:34px; object-fit:contain; border-radius:8px;" />
-                <div style="font-size:20px; font-weight:800; letter-spacing:-0.5px;">PurpleInsight</div>
+        <div style="padding:4px 0 20px;">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+                <img src="{logo_data_uri}" alt="NatWest logo"
+                     style="width:34px;height:34px;object-fit:contain;border-radius:8px;" />
+                <div style="font-size:20px;font-weight:800;letter-spacing:-0.5px;">PurpleInsight</div>
             </div>
-            <div style="font-size:11px; opacity:0.55; margin-top:2px;">NatWest Banking Intelligence</div>
+            <div style="font-size:11px;opacity:0.55;margin-top:2px;">NatWest Banking Intelligence</div>
         </div>
         """, unsafe_allow_html=True)
 
-        # Navigation
+        # ── Navigation (logical flow order) ──────────────────────────────────
         st.markdown("<div class='pi-sidebar-label'>NAVIGATION</div>", unsafe_allow_html=True)
-        pages = ["Analyse", "How It Works", "Data Explorer", "Dataset Registry"]
+        pages = ["How It Works", "Available Data", "Dataset Registry", "Analyse"]
         for page in pages:
             is_active = st.session_state["page"] == page
-            if st.button(
-                page,
-                key=f"nav_{page}",
-                use_container_width=True,
-                type="primary" if is_active else "secondary",
-            ):
+            if st.button(page, key=f"nav_{page}", use_container_width=True,
+                         type="primary" if is_active else "secondary"):
                 st.session_state["page"] = page
                 st.rerun()
 
-        # Demo queries
-        st.markdown("<div class='pi-sidebar-label'>TRY A DEMO QUERY</div>", unsafe_allow_html=True)
-
-        demo_map = {
-            "Revenue drop analysis": "Why did revenue drop in the South region last month?",
-            "Region comparison": "Compare North vs South region revenue for 2024",
-            "Cost breakdown": "Show the breakdown of costs by department",
-            "Weekly summary": "Give me a weekly summary of customer metrics",
-            "Product performance": "Compare Personal Current Account vs Credit Card performance this year",
-            "Customer churn analysis": "What caused customer churn to rise in Q3?",
-        }
-
-        active = st.session_state.get("active_demo")
-        for label, query in demo_map.items():
-            is_active = active == label
-            if st.button(
-                label,
-                key=f"demo_{label}",
-                use_container_width=True,
-                type="primary" if is_active else "secondary",
-            ):
-                triggered = query
-                st.session_state["active_demo"] = label
-
-        # Metrics glossary
-        st.markdown("<div class='pi-sidebar-label'>METRIC GLOSSARY</div>", unsafe_allow_html=True)
-        metrics = ["revenue", "churn_rate", "nps_score", "new_signups",
-                   "avg_handle_time", "active_customers", "digital_adoption"]
-        pills = " ".join(f"<span class='pi-pill'>{m}</span>" for m in metrics)
-        st.markdown(pills, unsafe_allow_html=True)
-
-        # Pipeline status
-        st.markdown("<div class='pi-sidebar-label'>SYSTEM STATUS</div>", unsafe_allow_html=True)
-        if pipeline:
-            st.markdown("""
-            <div style="font-size:12px; opacity:0.8;">
-                AI pipeline ready<br>
-                DuckDB connected<br>
-                Registered datasets loaded<br>
-                Groq Llama active
-            </div>
-            """, unsafe_allow_html=True)
-        else:
+        # ── Available datasets ────────────────────────────────────────────────
+        st.markdown("<div class='pi-sidebar-label'>LOADED DATASETS</div>", unsafe_allow_html=True)
+        all_datasets = list_registered_datasets()
+        for ds in all_datasets:
+            dot = "🟢" if ds["exists"] else "🔴"
             st.markdown(
-                f"""
-                <div style="font-size:12px; opacity:0.8;">
-                    Pipeline not connected<br>
-                    <span style="opacity:0.6;">Provider: {llm_status['provider']} ({llm_status['model']})</span><br>
-                    <span style="opacity:0.6;">{pipeline_issue}</span>
-                </div>
-                """,
+                f"<div style='font-size:11px;opacity:0.8;padding:2px 0;'>"
+                f"{dot} {ds['display_name']}</div>",
                 unsafe_allow_html=True,
             )
 
-        # Query count
-        count = len(st.session_state.get("chat_history", []))
-        if count > 0:
+        # ── System status ─────────────────────────────────────────────────────
+        st.markdown("<div class='pi-sidebar-label'>SYSTEM STATUS</div>", unsafe_allow_html=True)
+        if pipeline:
+            ds_count = len([d for d in all_datasets if d["exists"]])
             st.markdown(f"""
-            <div style="margin-top:16px; font-size:12px; opacity:0.6;">
-                {count} quer{'y' if count == 1 else 'ies'} this session
+            <div style="font-size:12px;opacity:0.8;">
+                AI pipeline ready<br>
+                {ds_count} dataset{'s' if ds_count != 1 else ''} loaded<br>
+                Groq · {llm_status['model']}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown(f"""
+            <div style="font-size:12px;opacity:0.8;">
+                Pipeline not connected<br>
+                <span style="opacity:0.6;">{pipeline_issue}</span>
             </div>
             """, unsafe_allow_html=True)
 
-    return triggered
+        count = len(st.session_state.get("chat_history", []))
+        if count > 0:
+            st.markdown(
+                f"<div style='margin-top:14px;font-size:12px;opacity:0.55;'>"
+                f"{count} quer{'y' if count == 1 else 'ies'} this session</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1020,11 +1013,22 @@ def render_result(entry: dict):
     confidence_label = result.get("trust", {}).get("confidence_label", "Medium")
     confidence_score = round(result.get("confidence", 0.0) * 100)
 
+    datasets_used = result.get("trust", {}).get("datasets_used", [])
+    ds_label = next(
+        (d["display_name"] for d in list_registered_datasets()
+         if d["dataset_id"] == datasets_used[0]) if datasets_used else [],
+        datasets_used[0] if datasets_used else "Unknown",
+    )
+
     st.markdown("<div class='pi-card pi-answer-card'>", unsafe_allow_html=True)
     st.markdown(f"""
     <div class="pi-result-query">
-        <span>Query</span>
+        <span style="color:#9a9aaa;">Query</span>
         <strong style="color:#42145f;">{entry['query']}</strong>
+        <span style="margin-left:auto; background:#f5f0fb; color:#6b3fa0; border-radius:12px;
+                     padding:2px 10px; font-size:11px; font-weight:600; white-space:nowrap;">
+            Source: {ds_label}
+        </span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1122,32 +1126,34 @@ def render_result(entry: dict):
     if trust:
         render_trust_panel(trust)
 
-    # Feedback row
+    # ── Feedback row ──────────────────────────────────────────────────────────
     st.markdown("<hr class='pi-divider'>", unsafe_allow_html=True)
-    col_q, col_up, col_dn, col_resp, _ = st.columns([2.5, 0.4, 0.4, 2, 4])
     fb_key = f"fb_{query_id}"
     fb_val = st.session_state.get(fb_key)
 
-    with col_q:
+    col_lbl, col_up, col_dn, col_resp = st.columns([2, 1, 1, 3])
+    with col_lbl:
         st.markdown(
-            "<p style='margin:6px 0; font-size:13px; color:#666;'>Was this helpful?</p>",
+            "<p style='margin:8px 0;font-size:13px;color:#666;font-weight:500;'>"
+            "Was this answer helpful?</p>",
             unsafe_allow_html=True,
         )
     with col_up:
-        if st.button("Helpful", key=f"up_{query_id}"):
+        if st.button("Helpful", key=f"up_{query_id}", use_container_width=True, type="primary"):
             st.session_state[fb_key] = "positive"
             st.session_state["feedback_counts"]["positive"] += 1
             st.rerun()
     with col_dn:
-        if st.button("Needs work", key=f"dn_{query_id}"):
+        if st.button("Needs work", key=f"dn_{query_id}", use_container_width=True):
             st.session_state[fb_key] = "negative"
             st.session_state["feedback_counts"]["negative"] += 1
             st.rerun()
     with col_resp:
         if fb_val == "positive":
             st.markdown(
-                "<span style='background:#d1fae5; color:#065f46; border-radius:20px;"
-                "padding:4px 14px; font-size:12px; font-weight:600;'>Marked as helpful</span>",
+                "<div style='background:#d1fae5;color:#065f46;border-radius:8px;"
+                "padding:6px 14px;font-size:12px;font-weight:600;margin-top:2px;'>"
+                "Marked as helpful — thank you!</div>",
                 unsafe_allow_html=True,
             )
         elif fb_val == "negative":
@@ -1163,135 +1169,281 @@ def render_result(entry: dict):
 # PAGE 1 — Analyse
 # ══════════════════════════════════════════════════════════════════════════════
 
+_DATASET_DEMOS = {
+    "regional_revenue": [
+        ("Revenue drop", "Why did revenue drop in the South region last month?"),
+        ("Compare regions", "Compare North vs South region revenue for 2024"),
+        ("Revenue breakdown", "Show breakdown of revenue by product for 2024"),
+        ("Channel growth", "Which channel drove the most revenue growth in 2024?"),
+    ],
+    "customer_metrics": [
+        ("Churn drivers", "What caused customer churn to rise in Q3 2024?"),
+        ("NPS by region", "Compare NPS scores across regions for 2024"),
+        ("Signup trends", "Show monthly new signup trends by customer segment"),
+        ("Complaint spike", "What drove the increase in customer complaints?"),
+    ],
+    "product_performance": [
+        ("Product compare", "Compare Personal Current Account vs Credit Card performance"),
+        ("Return rates", "Which product has the highest return rate?"),
+        ("Revenue by product", "Show breakdown of revenue by product"),
+        ("Satisfaction trend", "What is the trend in product satisfaction scores?"),
+    ],
+    "cost_breakdown": [
+        ("Cost by dept", "Show the breakdown of costs by department"),
+        ("Over budget", "Which departments are over budget in 2024?"),
+        ("Dept comparison", "Compare Technology vs Operations costs"),
+        ("Cost change", "What drove the increase in total costs in 2024?"),
+    ],
+    "weekly_kpis": [
+        ("Weekly summary", "Give me a weekly summary of customer metrics"),
+        ("NPS trends", "Show the trend in NPS score over the last 8 weeks"),
+        ("Digital adoption", "What is the trend in digital adoption rate?"),
+        ("Churn digest", "Give me a digest of churn and signup metrics"),
+    ],
+}
+
+def _get_demo_queries(dataset_id: str, display_name: str, use_cases: list) -> list:
+    """Return 4 demo query (label, query) pairs for a given dataset."""
+    if dataset_id in _DATASET_DEMOS:
+        return _DATASET_DEMOS[dataset_id]
+    demos = []
+    uc_templates = {
+        "change_analysis": (f"What changed?", f"Why did a metric change in {display_name}?"),
+        "compare":         (f"Compare categories", f"Compare the top categories in {display_name}"),
+        "breakdown":       (f"Breakdown", f"Show breakdown of {display_name} data by category"),
+        "summarize":       (f"Summary", f"Give me a summary of {display_name}"),
+    }
+    for uc in use_cases:
+        if uc in uc_templates:
+            demos.append(uc_templates[uc])
+    # pad to 4
+    while len(demos) < 4 and demos:
+        demos.append(demos[len(demos) % len(demos)])
+    return demos[:4]
+
+
 def page_analyse(pipeline):
-    """Main chat/analysis page."""
+    """Main analysis workspace — dataset selector → query → result."""
 
-    history = st.session_state.get("chat_history", [])
-    fb      = st.session_state.get("feedback_counts", {})
-    datasets = list_registered_datasets()
-    total_fb = fb.get("positive", 0) + fb.get("negative", 0)
-    helpful_pct = round(fb.get("positive", 0) / total_fb * 100) if total_fb > 0 else 0
+    all_datasets = list_registered_datasets()
+    available    = [d for d in all_datasets if d["exists"]]
+    history      = st.session_state.get("chat_history", [])
+    fb           = st.session_state.get("feedback_counts", {})
+    total_fb     = fb.get("positive", 0) + fb.get("negative", 0)
+    helpful_pct  = round(fb.get("positive", 0) / total_fb * 100) if total_fb > 0 else 0
 
-    llm_status = get_llm_runtime_status()
-    pipeline_status = "Ready" if pipeline else "Needs attention"
-    pipeline_detail = (
-        f"{llm_status['provider']} · {llm_status['model']}" if pipeline
-        else get_pipeline_issue(pipeline)
-    )
-
-    st.markdown(f"""
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown("""
     <div class="pi-hero">
-       <div class="pi-eyebrow">AI-powered business intelligence</div>
-
-<div class="pi-hero-title">
-From questions to insights — in seconds.
-</div>
-
-<div class="pi-hero-subtitle">
-Turn natural language into accurate analytics, complete with charts, explanations, and transparent data sources — all in one seamless experience.
-</div>
+        <div class="pi-eyebrow">NatWest · AI-Powered Banking Intelligence</div>
+        <div class="pi-hero-title">Ask your data anything.</div>
+        <div class="pi-hero-subtitle">
+            Select a dataset, type your question in plain English, and receive a verified,
+            narrated answer with charts and a full audit trail — in seconds.
+        </div>
+        <div class="pi-hero-meta">
+            <span class="pi-hero-pill">Change Analysis</span>
+            <span class="pi-hero-pill">Comparison</span>
+            <span class="pi-hero-pill">Breakdown</span>
+            <span class="pi-hero-pill">Summary</span>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown(f"""
-        <div class='pi-stat'>
-            <div class='pi-stat-value'>{len(history)}</div>
-            <div class='pi-stat-label'>Queries this session</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col2:
-        st.markdown(f"""
-        <div class='pi-stat'>
-            <div class='pi-stat-value'>{len(datasets)}</div>
-            <div class='pi-stat-label'>Datasets loaded</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col3:
-        st.markdown(f"""
-        <div class='pi-stat'>
-            <div class='pi-stat-value'>
-                {helpful_pct}%
-            </div>
-            <div class='pi-stat-label'>Helpfulness score</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with col4:
-        st.markdown(f"""
-        <div class='pi-stat'>
-            <div class='pi-stat-value'>{"Ready" if pipeline else "Review"}</div>
-            <div class='pi-stat-label'>Pipeline status</div>
-        </div>
-        """, unsafe_allow_html=True)
+    # ── Stats ─────────────────────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    stats = [
+        (str(len(history)), "Queries this session"),
+        (str(len(available)), "Datasets available"),
+        (f"{helpful_pct}%", "Helpfulness score"),
+        ("Ready" if pipeline else "Review", "Pipeline status"),
+    ]
+    for col, (val, lbl) in zip([c1, c2, c3, c4], stats):
+        with col:
+            st.markdown(f"""
+            <div class='pi-stat'>
+                <div class='pi-stat-value'>{val}</div>
+                <div class='pi-stat-label'>{lbl}</div>
+            </div>""", unsafe_allow_html=True)
 
     st.markdown("<div style='margin-top:18px;'></div>", unsafe_allow_html=True)
 
+    # ── New dataset notification ───────────────────────────────────────────────
+    newly = st.session_state.get("newly_registered")
+    if newly:
+        col_n, col_x = st.columns([11, 1])
+        with col_n:
+            st.markdown(f"""
+            <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:10px;
+                        padding:12px 18px;margin-bottom:14px;">
+                <span style="font-size:13px;font-weight:700;color:#166534;">
+                    New dataset ready: {newly['display_name']}
+                </span>
+                <span style="font-size:12px;color:#166534;margin-left:8px;">
+                    — select it below and start querying.
+                </span>
+            </div>""", unsafe_allow_html=True)
+        with col_x:
+            if st.button("×", key="dismiss_notif"):
+                st.session_state["newly_registered"] = None
+                st.rerun()
+
+    # ── Dataset selector ─────────────────────────────────────────────────────
+    if not available:
+        st.error("No datasets are available. Go to Dataset Registry to add one.")
+        return
+
     st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
-    query = render_query_input()
+    st.markdown("<div class='pi-panel-title'>1 — Choose a dataset</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='pi-panel-subtitle'>Select the dataset you want to query. "
+        "Your question will be answered using this data source.</div>",
+        unsafe_allow_html=True,
+    )
+
+    ds_options   = [d["dataset_id"] for d in available]
+    ds_fmt       = {d["dataset_id"]: d["display_name"] for d in available}
+    default_idx  = 0
+    prev_sel     = st.session_state.get("selected_dataset")
+    if prev_sel and prev_sel in ds_options:
+        default_idx = ds_options.index(prev_sel)
+
+    selected_id = st.selectbox(
+        "Dataset",
+        options=ds_options,
+        index=default_idx,
+        format_func=lambda did: ds_fmt.get(did, did),
+        label_visibility="collapsed",
+        key="dataset_picker",
+    )
+    st.session_state["selected_dataset"] = selected_id
+
+    # Show dataset info card
+    sel_meta = next((d for d in available if d["dataset_id"] == selected_id), {})
+    uc_badges = "".join(
+        f"<span style='background:#e8dff5;color:#42145f;border-radius:12px;padding:2px 10px;"
+        f"font-size:11px;font-weight:600;margin-right:4px;'>{uc.replace('_',' ').title()}</span>"
+        for uc in sel_meta.get("primary_use_cases", [])
+    )
+    st.markdown(f"""
+    <div style="background:#faf8fd;border:1px solid #ece3f5;border-radius:10px;
+                padding:12px 16px;margin-top:10px;">
+        <div style="font-size:13px;color:#3d3d4a;margin-bottom:4px;">
+            <strong>{sel_meta.get('display_name','')}</strong>
+            <span style="color:#9a9aaa;font-size:11px;margin-left:8px;">
+                {sel_meta.get('category','')}
+            </span>
+        </div>
+        <div style="font-size:12px;color:#666;margin-bottom:8px;">
+            {sel_meta.get('description','')}
+        </div>
+        <div>{uc_badges}</div>
+    </div>
+    """, unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Auto-submit from demo buttons or follow-ups
-    auto = st.session_state.pop("auto_query", None)
-    final_query = auto or query
+    # ── Query input ───────────────────────────────────────────────────────────
+    st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='pi-panel-title'>2 — Ask your question</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='pi-panel-subtitle'>Type a banking question in plain English. "
+        "Use the example queries below to get started.</div>",
+        unsafe_allow_html=True,
+    )
 
-    if final_query and final_query.strip():
-        if not pipeline:
-            st.error(
-                "Pipeline not available. "
-                f"{get_pipeline_issue(pipeline)} "
-                "Also make sure the required dependencies are installed."
+    # Inline demo queries for selected dataset
+    demos = _get_demo_queries(
+        selected_id,
+        sel_meta.get("display_name", selected_id),
+        sel_meta.get("primary_use_cases", []),
+    )
+    if demos:
+        st.markdown("<div class='pi-section-label' style='margin-top:8px;'>Example queries</div>",
+                    unsafe_allow_html=True)
+        demo_cols = st.columns(len(demos))
+        for col, (label, q) in zip(demo_cols, demos):
+            with col:
+                if st.button(label, key=f"demo_{selected_id}_{label}", use_container_width=True):
+                    st.session_state["auto_query"] = q
+                    st.rerun()
+
+    with st.form("main_query_form", clear_on_submit=False):
+        query = st.text_input(
+            "Ask your data",
+            placeholder=f"e.g. {demos[0][1] if demos else 'Ask a question about the data…'}",
+            label_visibility="collapsed",
+        )
+        col_hint, col_btn = st.columns([5, 1.2])
+        with col_hint:
+            st.markdown(
+                "<div class='pi-query-hint'>Questions can include: why did X change, "
+                "compare A vs B, show breakdown of X, give me a summary.</div>",
+                unsafe_allow_html=True,
             )
-        else:
-            with st.spinner("Analysing your question..."):
-                result = run_pipeline(final_query.strip(), pipeline)
+        with col_btn:
+            submitted = st.form_submit_button("Analyse", type="primary", use_container_width=True)
 
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Run pipeline ──────────────────────────────────────────────────────────
+    auto        = st.session_state.pop("auto_query", None)
+    final_query = (query.strip() if submitted and query else None) or auto
+
+    if final_query:
+        if not pipeline:
+            st.error(f"Pipeline not available. {get_pipeline_issue(pipeline)}")
+        else:
+            with st.spinner(f"Analysing using {sel_meta.get('display_name', selected_id)}…"):
+                result = run_pipeline(final_query, pipeline, forced_dataset=selected_id)
             entry = {
-                "query":    final_query.strip(),
+                "query":    final_query,
                 "result":   result,
                 "query_id": str(uuid.uuid4())[:8],
+                "dataset":  selected_id,
             }
             st.session_state["chat_history"].append(entry)
 
     history = st.session_state.get("chat_history", [])
 
+    # ── Result ────────────────────────────────────────────────────────────────
     if not history:
         st.markdown("""
         <div class='pi-card pi-empty'>
-            <div class='pi-empty-icon'>Data</div>
-            <div class='pi-empty-title'>Your analysis workspace is ready</div>
+            <div class='pi-empty-icon'>💬</div>
+            <div class='pi-empty-title'>Ready to answer your banking questions</div>
             <div class='pi-empty-sub'>
-                Start with a query above or use one of the guided examples to see the full flow.<br>
-                <span style="color:#b39bd1; margin-top:6px; display:block;">
-                    Revenue drivers · Region comparisons · Department cost breakdowns · Weekly KPI summaries
-                </span>
+                Select a dataset above, pick an example query or write your own, then click Analyse.
             </div>
         </div>
         """, unsafe_allow_html=True)
         return
 
-    latest = history[-1]
-    render_result(latest)
+    st.markdown(
+        "<div style='margin-top:6px;'></div>",
+        unsafe_allow_html=True,
+    )
+    render_result(history[-1])
 
     if len(history) > 1:
-        with st.expander(f"Recent Query History ({len(history)-1})", expanded=False):
-            st.markdown("<div class='pi-card pi-history-card'>", unsafe_allow_html=True)
+        with st.expander(f"Previous queries this session ({len(history)-1})", expanded=False):
             for entry in reversed(history[:-1]):
-                st.markdown(f"""
-                <div class="pi-history-item">
-                    <div class="pi-history-title">{entry['query']}</div>
-                    <div class="pi-history-meta">Use case: {getattr(entry['result'].get('use_case'), 'value', 'analysis')} · Runtime: {entry['result'].get('query_ms', 0)}ms</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                if st.button(
-                    "Re-run this query",
-                    key=f"rerun_{entry['query_id']}",
-                    type="secondary",
-                ):
-                    st.session_state["auto_query"] = entry["query"]
-                    st.rerun()
-            st.markdown("</div>", unsafe_allow_html=True)
+                ds_name = ds_fmt.get(entry.get("dataset", ""), entry.get("dataset", ""))
+                col_info, col_rerun = st.columns([5, 1])
+                with col_info:
+                    st.markdown(f"""
+                    <div class="pi-history-item">
+                        <div class="pi-history-title">{entry['query']}</div>
+                        <div class="pi-history-meta">
+                            Dataset: {ds_name} ·
+                            Use case: {getattr(entry['result'].get('use_case'), 'value', 'analysis')} ·
+                            {entry['result'].get('query_ms', 0)}ms
+                        </div>
+                    </div>""", unsafe_allow_html=True)
+                with col_rerun:
+                    if st.button("Re-run", key=f"rerun_{entry['query_id']}", use_container_width=True):
+                        st.session_state["auto_query"] = entry["query"]
+                        st.session_state["selected_dataset"] = entry.get("dataset", selected_id)
+                        st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1299,125 +1451,253 @@ Turn natural language into accurate analytics, complete with charts, explanation
 # ══════════════════════════════════════════════════════════════════════════════
 
 def page_how_it_works():
-    """Explains the system architecture for non-technical users and judges."""
+    """Landing page — hero, feature coverage, pipeline walkthrough, use cases."""
 
+    # ── Hero (same as Analyse, since this is now the entry point) ─────────────
     st.markdown("""
-    <div class='pi-card-purple'>
-        <div style="font-size:22px; font-weight:800; color:#42145f; margin-bottom:6px;">
-            How PurpleInsight Works
+    <div class="pi-hero">
+        <div class="pi-eyebrow">NatWest · Code for Purpose Hackathon 2026</div>
+        <div class="pi-hero-title">PurpleInsight — Talk to Data.</div>
+        <div class="pi-hero-subtitle">
+            Ask any banking question in plain English. PurpleInsight classifies your intent,
+            generates verified SQL, runs it against your data in milliseconds, and returns
+            a narrated answer with charts and a full audit trail — no SQL knowledge required.
         </div>
-        <div style="font-size:14px; color:#6b3fa0; line-height:1.6;">
-            PurpleInsight removes friction between non-technical users and their data.
-            Ask a question in plain English — get a trusted, verified answer in seconds.
+        <div class="pi-hero-meta">
+            <span class="pi-hero-pill">NatWest Banking Datasets</span>
+            <span class="pi-hero-pill">Groq · Llama 3.1 70B</span>
+            <span class="pi-hero-pill">DuckDB In-Memory</span>
+            <span class="pi-hero-pill">23 Tests Passing</span>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    # 3 pillars
-    st.markdown("### The Three Pillars")
+    # ── CTA button ────────────────────────────────────────────────────────────
+    col_cta, _ = st.columns([2, 5])
+    with col_cta:
+        if st.button("Start Analysing Data", type="primary", use_container_width=True):
+            st.session_state["page"] = "Analyse"
+            st.rerun()
+
+    st.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
+
+    # ── Three pillars ─────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns(3)
-    pillars = [
-        ("1", "Clarity", "Answers in plain English. No SQL. No jargon. No data science degree required."),
-        ("2", "Trust", "Every answer shows the SQL that ran, which metrics were used, and the data source. Nothing is hidden."),
-        ("3", "Speed", "DuckDB executes queries in milliseconds. Groq-powered Llama generates answers in under 2 seconds."),
-    ]
-    for col, (num, title, desc) in zip([c1, c2, c3], pillars):
+    for col, (num, title, desc) in zip([c1, c2, c3], [
+        ("1", "Clarity",  "Answers in plain English. No SQL, no jargon, no data science degree required."),
+        ("2", "Trust",    "Every answer shows the SQL executed, metric definitions applied, and source dataset. Nothing is hidden."),
+        ("3", "Speed",    "DuckDB executes queries in milliseconds. Groq Llama generates narrated answers in under 2 seconds."),
+    ]):
         with col:
             st.markdown(f"""
             <div class='hiw-step'>
                 <div class='hiw-step-number'>{num}</div>
                 <div class='hiw-step-title'>{title}</div>
                 <div class='hiw-step-body'>{desc}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            </div>""", unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
 
-    # Pipeline steps
-    st.markdown("### The AI Pipeline — Step by Step")
+    # ── Feature coverage grid ─────────────────────────────────────────────────
+    st.markdown("""
+    <div style="font-size:11px;font-weight:800;letter-spacing:0.12em;color:#9893a7;
+                text-transform:uppercase;margin-bottom:14px;">
+        What is covered
+    </div>
+    """, unsafe_allow_html=True)
+
+    features = [
+        ("Natural Language → SQL",
+         "Type a plain-English question and receive a validated DuckDB SQL query. "
+         "The LLM is constrained to SELECT-only with schema-aware prompting.",
+         "Groq · Llama 3.3 70B · DuckDB"),
+        ("4 Use Case Intent Router",
+         "Queries are automatically classified into change_analysis, compare, breakdown, "
+         "or summarize — each with a tailored prompt template and output format.",
+         "Keyword match → semantic fallback · sentence-transformers"),
+        ("Semantic Metric Dictionary",
+         "20 NatWest banking metrics (revenue, churn rate, NPS, complaints, etc.) defined "
+         "in metrics.yaml. Every query resolves terms through this dictionary before the LLM.",
+         "metrics.yaml · 20 metrics · canonical definitions"),
+        ("Trust Trail Panel",
+         "Every answer shows: SQL executed, metric definitions applied, data source, "
+         "confidence level (HIGH/MEDIUM/LOW with reason), and thumbs up/down feedback.",
+         "Built in-app · no external dependency"),
+        ("Ambiguity Handler",
+         "Vague time references like 'last month', 'this quarter', 'recently' are resolved "
+         "into concrete date filters before SQL generation — no wrong date ranges.",
+         "python-dateutil · zero API cost"),
+        ("Auto Chart Selection",
+         "Breakdown → stacked bar, Compare → grouped bar or line, "
+         "Change Analysis → waterfall, Summarize → KPI cards. All styled in NatWest purple.",
+         "Plotly · #42145f theme"),
+        ("Dataset Registry",
+         "New CSVs can be uploaded and registered through the UI with no code changes. "
+         "Schema is auto-detected and the dataset is immediately queryable.",
+         "config/datasets.yaml · DuckDB views"),
+        ("Zero Raw Data Exposure",
+         "Only aggregated query results are ever returned. Row-level data never leaves "
+         "the engine — enforced at both SQL validation and engine level.",
+         "SELECT + aggregates only · MAX 50 rows"),
+        ("LLM Fallback",
+         "If the primary LLM (Groq) is unavailable, deterministic local SQL generation "
+         "keeps the system running — demo never breaks on connectivity issues.",
+         "Local fallback · no downtime"),
+        ("FastAPI Backend",
+         "Programmatic access via /query, /metrics, /health, and /feedback endpoints — "
+         "the full pipeline is accessible as a REST API for integration.",
+         "FastAPI · /query · /feedback"),
+        ("Streamlit UI",
+         "Clean product interface with NatWest branding, dataset selector, "
+         "inline example queries, data explorer, and dataset registry.",
+         "Streamlit · DM Sans · #42145f"),
+        ("23 Tests Passing",
+         "Covering intent routing, ambiguity handling, SQL generation, query engine, "
+         "trust builder, and dataset registry — ensuring reliability.",
+         "pytest · 23 tests · all green"),
+    ]
+
+    # Render in a 3-column grid
+    for row_start in range(0, len(features), 3):
+        cols = st.columns(3)
+        for col, feat in zip(cols, features[row_start:row_start + 3]):
+            title_f, desc_f, tech_f = feat
+            with col:
+                st.markdown(f"""
+                <div style="background:white;border:1px solid #ece3f5;border-radius:12px;
+                            padding:16px 18px;margin-bottom:14px;
+                            box-shadow:0 4px 12px rgba(66,20,95,0.05);height:100%;">
+                    <div style="font-size:13px;font-weight:700;color:#42145f;margin-bottom:6px;">
+                        {title_f}
+                    </div>
+                    <div style="font-size:12px;color:#555;line-height:1.6;margin-bottom:10px;">
+                        {desc_f}
+                    </div>
+                    <div style="background:#f5f0fb;border-radius:6px;padding:4px 10px;
+                                font-size:10px;color:#6b3fa0;font-family:monospace;
+                                display:inline-block;">
+                        {tech_f}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
+
+    # ── AI Pipeline step-by-step ──────────────────────────────────────────────
+    st.markdown("""
+    <div style="font-size:11px;font-weight:800;letter-spacing:0.12em;color:#9893a7;
+                text-transform:uppercase;margin-bottom:14px;">
+        The AI Pipeline — Step by Step
+    </div>
+    """, unsafe_allow_html=True)
 
     steps = [
         ("1", "Ambiguity Handler",
-         "Detects vague time references like 'last month' or 'this week' and resolves them to exact dates before anything else happens. You never get a wrong date range.",
+         "Detects vague time references like 'last month' or 'this week' and resolves them "
+         "to exact dates before anything else happens. You never get a wrong date range.",
          "Pure Python · python-dateutil · zero API cost"),
-
         ("2", "Intent Router",
-         "Classifies your question into one of 4 use cases: Change Analysis, Comparison, Breakdown, or Summary. Uses local sentence-transformer embeddings — fast and free, no API call needed.",
+         "Classifies your question into one of 4 use cases: Change Analysis, Comparison, "
+         "Breakdown, or Summary. Uses local sentence-transformer embeddings — no API call.",
          "sentence-transformers · all-MiniLM-L6-v2 · runs locally"),
-
-        ("3", "Metric Dictionary",
-         "Every query is resolved through a YAML metric dictionary before hitting the LLM. This ensures 'revenue' always means the same thing across all queries, teams, and time periods — a NatWest requirement.",
-         "metrics.yaml · 20+ metric definitions · canonical NatWest terms"),
-
+        ("3", "Semantic Metric Dictionary",
+         "Every query is resolved through a YAML metric dictionary before hitting the LLM. "
+         "This ensures 'revenue' always means the same thing across all queries and teams.",
+         "metrics.yaml · 20 metric definitions · canonical NatWest terms"),
         ("4", "NL to SQL (Groq)",
-         "Groq-hosted Llama converts your natural language question into a valid DuckDB SQL query, using the metric definitions and table schemas injected into the prompt. Only SELECT queries are allowed.",
-         "Llama 3.1 70B · DuckDB SQL · schema-aware prompting"),
-
+         "Groq-hosted Llama converts your question into a valid DuckDB SQL query using "
+         "metric definitions and table schemas. Only SELECT queries are allowed.",
+         "Llama 3.3 70B · DuckDB SQL · schema-aware prompting"),
         ("5", "Query Engine",
-         "DuckDB executes the SQL directly against the CSV datasets in memory. No database server. No cloud. Raw rows are never returned — only aggregates. Results are validated before leaving this layer.",
+         "DuckDB executes the SQL directly in memory. No database server, no cloud. "
+         "Raw rows are never returned — only aggregates up to 50 rows.",
          "DuckDB in-memory · MAX 50 rows · aggregates only"),
-
         ("6", "Narrative (Groq)",
-         "Groq-hosted Llama converts the query results into a clear, plain-English answer using use-case-specific templates. The output matches the exact format from the NatWest problem document.",
-         "Llama 3.1 70B · 4 narrative templates · anomaly detection"),
-
+         "Groq Llama converts query results into a plain-English answer using "
+         "use-case-specific templates that match the NatWest problem document format.",
+         "Llama 3.3 70B · 4 narrative templates · anomaly detection"),
         ("7", "Trust Trail",
-         "Every answer is wrapped in a full trust trail showing: the SQL executed, metric definitions applied, dataset used, confidence level, and whether any raw data was exposed (never).",
-         "Built in-app · no external dependency · judge-visible"),
+         "Every answer is wrapped in a full audit trail: SQL executed, metric definitions "
+         "applied, dataset used, confidence level, and raw data exposure status (always none).",
+         "Built in-app · no external dependency"),
     ]
 
     for num, title, desc, tech in steps:
         with st.expander(f"Step {num} — {title}", expanded=(num == "1")):
             col_desc, col_tech = st.columns([3, 1])
             with col_desc:
-                st.markdown(f"<p style='font-size:14px; color:#444; line-height:1.6;'>{desc}</p>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<p style='font-size:14px;color:#444;line-height:1.6;'>{desc}</p>",
+                    unsafe_allow_html=True,
+                )
             with col_tech:
                 st.markdown(f"""
-                <div style="background:#f5f0fb; border-radius:8px; padding:10px 12px;
-                            font-size:11px; color:#6b3fa0; font-family:monospace; line-height:1.6;">
+                <div style="background:#f5f0fb;border-radius:8px;padding:10px 12px;
+                            font-size:11px;color:#6b3fa0;font-family:monospace;line-height:1.6;">
                     {tech}
-                </div>
-                """, unsafe_allow_html=True)
+                </div>""", unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<div style='margin-top:28px;'></div>", unsafe_allow_html=True)
 
-    # 4 use cases
-    st.markdown("### The 4 Use Cases")
+    # ── 4 use cases with examples ─────────────────────────────────────────────
+    st.markdown("""
+    <div style="font-size:11px;font-weight:800;letter-spacing:0.12em;color:#9893a7;
+                text-transform:uppercase;margin-bottom:14px;">
+        The 4 Use Cases — with Example Outputs
+    </div>
+    """, unsafe_allow_html=True)
+
     use_cases = [
-        ("1", "Change Analysis", "Why did revenue drop last month?",
+        ("1", "Change Analysis", "change",
+         "Why did revenue drop last month?",
          "Revenue decreased by 20.5% in Feb 2024. The biggest contributor was a 27.6% drop in the South region coinciding with a churn spike from 5.3% to 9.1%."),
-        ("2", "Comparison", "Compare North vs South region revenue",
+        ("2", "Comparison", "compare",
+         "Compare North vs South region revenue",
          "North outperforms South by £3.1M (+26.6%) in H1 2024. South was severely impacted in Feb–Apr where revenue fell 27.6%."),
-        ("3", "Breakdown", "Show the breakdown of costs by department",
+        ("3", "Breakdown", "breakdown",
+         "Show the breakdown of costs by department",
          "Technology accounts for 32% of total costs at £25.9M, followed by Operations at 24%. Combined they represent over half of total spend."),
-        ("4", "Summary", "Give me a weekly summary of customer metrics",
+        ("4", "Summary", "summary",
+         "Give me a weekly summary of customer metrics",
          "This week: Signups grew by 5%, churn remained stable at 1.8%, NPS improved to 44, and average handle time decreased by 12 seconds."),
     ]
 
-    for order, title, query_ex, output_ex in use_cases:
+    badge_styles = {
+        "change":    ("pi-badge-change",    "#92400e", "#fef3c7"),
+        "compare":   ("pi-badge-compare",   "#1e40af", "#dbeafe"),
+        "breakdown": ("pi-badge-breakdown", "#065f46", "#d1fae5"),
+        "summary":   ("pi-badge-summary",   "#42145f", "#e8dff5"),
+    }
+
+    for order, title, uc_key, query_ex, output_ex in use_cases:
+        _, text_color, bg_color = badge_styles[uc_key]
         st.markdown(f"""
         <div class='pi-card' style='margin-bottom:10px;'>
-            <div style='font-size:15px; font-weight:700; color:#42145f; margin-bottom:8px;'>
-                Use Case {order} · {title}
+            <div style='display:flex;align-items:center;gap:10px;margin-bottom:10px;'>
+                <span style='background:{bg_color};color:{text_color};border-radius:20px;
+                             padding:3px 12px;font-size:11px;font-weight:700;'>
+                    {title}
+                </span>
+                <span style='font-size:13px;color:#9a9aaa;'>Use Case {order}</span>
             </div>
-            <div style='display:flex; gap:16px; flex-wrap:wrap;'>
-                <div style='flex:1; min-width:200px;'>
-                    <div style='font-size:10px; font-weight:800; letter-spacing:0.1em;
-                                color:#9a9aaa; text-transform:uppercase; margin-bottom:4px;'>
+            <div style='display:flex;gap:16px;flex-wrap:wrap;'>
+                <div style='flex:1;min-width:200px;'>
+                    <div style='font-size:10px;font-weight:800;letter-spacing:0.1em;
+                                color:#9a9aaa;text-transform:uppercase;margin-bottom:4px;'>
                         Example Query
                     </div>
-                    <div style='background:#f5f0fb; border-radius:6px; padding:8px 12px;
-                                font-size:13px; color:#42145f; font-style:italic;'>
+                    <div style='background:#f5f0fb;border-radius:6px;padding:8px 12px;
+                                font-size:13px;color:#42145f;font-style:italic;'>
                         "{query_ex}"
                     </div>
                 </div>
-                <div style='flex:2; min-width:250px;'>
-                    <div style='font-size:10px; font-weight:800; letter-spacing:0.1em;
-                                color:#9a9aaa; text-transform:uppercase; margin-bottom:4px;'>
+                <div style='flex:2;min-width:250px;'>
+                    <div style='font-size:10px;font-weight:800;letter-spacing:0.1em;
+                                color:#9a9aaa;text-transform:uppercase;margin-bottom:4px;'>
                         Example Output
                     </div>
-                    <div style='background:#f0fdf4; border-radius:6px; padding:8px 12px;
-                                font-size:13px; color:#166534;'>
+                    <div style='background:#f0fdf4;border-radius:6px;padding:8px 12px;
+                                font-size:13px;color:#166534;'>
                         {output_ex}
                     </div>
                 </div>
@@ -1425,19 +1705,26 @@ def page_how_it_works():
         </div>
         """, unsafe_allow_html=True)
 
-    # Security note
-    st.markdown("### Security & Data Privacy")
+    # ── Security note ─────────────────────────────────────────────────────────
     st.markdown("""
-    <div class='pi-card' style='border-left:4px solid #42145f;'>
-        <div style='font-size:14px; color:#444; line-height:1.65;'>
-            <strong>No raw data is ever exposed by design.</strong>
-            The query engine is intended to return aggregated results for decision support, while the trust layer surfaces data sources and executed SQL.
-            The bundled demo datasets are synthetic and suitable for hackathon presentation.
-            Any uploaded datasets remain local to this workspace.
-            API keys are stored in <code>.env</code> and never committed to GitHub.
+    <div class='pi-card' style='border-left:4px solid #42145f;margin-top:8px;'>
+        <div style='font-size:14px;color:#444;line-height:1.65;'>
+            <strong>Security &amp; Data Privacy.</strong>
+            No raw data is ever exposed by design. The query engine returns only aggregated
+            results. Uploaded datasets remain local to this workspace. API keys are stored
+            in <code>.env</code> and never committed to version control.
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Bottom CTA ────────────────────────────────────────────────────────────
+    st.markdown("<div style='margin-top:20px;'></div>", unsafe_allow_html=True)
+    col_b, _ = st.columns([2, 5])
+    with col_b:
+        if st.button("Go to Analyse", key="hiw_cta_bottom", type="primary",
+                     use_container_width=True):
+            st.session_state["page"] = "Analyse"
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1445,17 +1732,17 @@ def page_how_it_works():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def page_data_explorer():
-    """Browse registered datasets directly."""
+    """Browse all registered datasets with full previews and schema info."""
 
     st.markdown("""
     <div class='pi-card-purple'>
-        <div style="font-size:20px; font-weight:800; color:#42145f; margin-bottom:4px;">
-            Data Explorer
+        <div style="font-size:20px;font-weight:800;color:#42145f;margin-bottom:4px;">
+            Available Data
         </div>
-        <div style="font-size:13px; color:#6b3fa0;">
-            Browse the registered datasets powering PurpleInsight.
-            The bundled demo datasets are generated by <code>scripts/generate_synthetic_data.py</code>.
-            Newly added datasets are registered locally and remain inside this workspace.
+        <div style="font-size:13px;color:#6b3fa0;line-height:1.6;">
+            All datasets currently loaded into PurpleInsight. Built-in datasets are synthetic
+            NatWest banking data. Custom datasets you register appear here automatically.
+            Click on a dataset tab to explore its schema and preview.
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1463,118 +1750,196 @@ def page_data_explorer():
     datasets = list_registered_datasets()
 
     if not datasets:
-        st.warning("No datasets are registered yet. Add one in the Dataset Registry page first.")
+        st.warning("No datasets registered yet. Go to Dataset Registry to add one.")
         return
 
-    selected = st.selectbox(
-        "Select a dataset to explore",
-        options=[item["dataset_id"] for item in datasets],
-        format_func=lambda dataset_id: next(
-            item["display_name"] for item in datasets if item["dataset_id"] == dataset_id
-        ),
-    )
+    tab_labels = [d["display_name"] for d in datasets]
+    tabs = st.tabs(tab_labels)
 
-    selected_dataset = next(item for item in datasets if item["dataset_id"] == selected)
-    title = selected_dataset["display_name"]
-    desc = selected_dataset["description"]
-    use_cases = ", ".join(selected_dataset["primary_use_cases"])
-    filepath = selected_dataset["file_path"]
+    for tab, ds in zip(tabs, datasets):
+        with tab:
+            filepath = ds["file_path"]
 
-    if os.path.exists(filepath):
-        df = pd.read_csv(filepath)
-
-        # Dataset header
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
+            # ── Dataset header ─────────────────────────────────────────────
+            uc_badges = "".join(
+                f"<span style='background:#e8dff5;color:#42145f;border-radius:12px;"
+                f"padding:2px 10px;font-size:11px;font-weight:600;margin-right:4px;'>"
+                f"{uc.replace('_',' ').title()}</span>"
+                for uc in ds.get("primary_use_cases", [])
+            )
+            status_color = "#166534" if ds["exists"] else "#991b1b"
+            status_text  = "File available" if ds["exists"] else "File missing — re-upload via Dataset Registry"
             st.markdown(f"""
-            <div class='pi-stat'>
-                <div class='pi-stat-value'>{len(df):,}</div>
-                <div class='pi-stat-label'>Total rows</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with col_b:
-            st.markdown(f"""
-            <div class='pi-stat'>
-                <div class='pi-stat-value'>{len(df.columns)}</div>
-                <div class='pi-stat-label'>Columns</div>
-            </div>
-            """, unsafe_allow_html=True)
-        with col_c:
-            st.markdown(f"""
-            <div class='pi-stat'>
-                <div class='pi-stat-value'>{df.isnull().sum().sum()}</div>
-                <div class='pi-stat-label'>Null values</div>
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;
+                        flex-wrap:wrap;gap:10px;margin-bottom:14px;">
+                <div>
+                    <div style="font-size:16px;font-weight:700;color:#42145f;">
+                        {ds['display_name']}
+                    </div>
+                    <div style="font-size:13px;color:#666;margin:4px 0 8px;">
+                        {ds.get('description','')}
+                    </div>
+                    <div>{uc_badges}</div>
+                </div>
+                <div style="font-size:12px;color:{status_color};font-weight:600;white-space:nowrap;">
+                    {status_text}
+                </div>
             </div>
             """, unsafe_allow_html=True)
 
-        st.markdown(f"""
-        <div style='font-size:13px; color:#666; margin:12px 0 16px;'>
-            {desc} · Used for: <strong style='color:#42145f;'>{use_cases}</strong>
-        </div>
-        """, unsafe_allow_html=True)
+            if not os.path.exists(filepath):
+                st.info("Upload the CSV file in Dataset Registry to make this dataset queryable.")
+                continue
 
-        # Preview
-        st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
-        st.markdown(f"<div class='pi-table-header'>Preview — {title}</div>", unsafe_allow_html=True)
-        st.dataframe(df.head(20), use_container_width=True, hide_index=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+            df = pd.read_csv(filepath)
 
-        # Column schema
-        with st.expander("Column schema", expanded=False):
-            schema_data = []
-            for col in df.columns:
-                schema_data.append({
-                    "Column":   col,
-                    "Type":     str(df[col].dtype),
-                    "Non-null": df[col].count(),
-                    "Unique":   df[col].nunique(),
-                    "Sample":   str(df[col].iloc[0]) if len(df) > 0 else "",
-                })
-            st.dataframe(pd.DataFrame(schema_data), use_container_width=True, hide_index=True)
+            # ── Stats row ──────────────────────────────────────────────────
+            c1, c2, c3, c4 = st.columns(4)
+            for col, (val, lbl) in zip([c1, c2, c3, c4], [
+                (f"{len(df):,}", "Total rows"),
+                (str(len(df.columns)), "Columns"),
+                (str(df.isnull().sum().sum()), "Null values"),
+                (ds.get("category", "—"), "Category"),
+            ]):
+                with col:
+                    st.markdown(f"""
+                    <div class='pi-stat'>
+                        <div class='pi-stat-value' style='font-size:18px;'>{val}</div>
+                        <div class='pi-stat-label'>{lbl}</div>
+                    </div>""", unsafe_allow_html=True)
 
-        # Numeric stats
-        numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns
-        if len(numeric_cols) > 0:
-            with st.expander("Numeric statistics", expanded=False):
-                st.dataframe(
-                    df[numeric_cols].describe().round(2),
-                    use_container_width=True,
-                )
-    else:
-        st.error(f"File not found: {filepath}")
+            st.markdown("<div style='margin-top:14px;'></div>", unsafe_allow_html=True)
+
+            # ── Data preview ───────────────────────────────────────────────
+            st.markdown("<div class='pi-section-label'>Data Preview (first 20 rows)</div>",
+                        unsafe_allow_html=True)
+            st.dataframe(df.head(20), use_container_width=True, hide_index=True)
+
+            # ── Schema + stats in expanders ────────────────────────────────
+            col_schema, col_stats = st.columns(2)
+            with col_schema:
+                with st.expander("Column schema", expanded=False):
+                    schema_rows = [
+                        {"Column": c, "Type": str(df[c].dtype),
+                         "Unique values": df[c].nunique(),
+                         "Sample": str(df[c].iloc[0]) if len(df) > 0 else ""}
+                        for c in df.columns
+                    ]
+                    st.dataframe(pd.DataFrame(schema_rows), use_container_width=True, hide_index=True)
+
+            with col_stats:
+                num_cols = df.select_dtypes(include=["float64", "int64"]).columns
+                if len(num_cols) > 0:
+                    with st.expander("Numeric statistics", expanded=False):
+                        st.dataframe(df[num_cols].describe().round(2),
+                                     use_container_width=True)
+
+            # ── Query shortcut ─────────────────────────────────────────────
+            st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
+            if st.button(f"Query {ds['display_name']} in Analyse",
+                         key=f"explore_query_{ds['dataset_id']}", type="primary"):
+                st.session_state["selected_dataset"] = ds["dataset_id"]
+                st.session_state["page"] = "Analyse"
+                st.rerun()
 
 
 def page_dataset_registry():
     """Upload and register datasets in one central place."""
     st.markdown("""
     <div class='pi-card-purple'>
-        <div style="font-size:20px; font-weight:800; color:#42145f; margin-bottom:4px;">
+        <div style="font-size:20px; font-weight:800; color:#42145f;">
             Dataset Registry
-        </div>
-        <div style="font-size:13px; color:#6b3fa0;">
-            Add new datasets in one dedicated place. Files are stored in <code>data/raw</code> and metadata is written to <code>config/datasets.yaml</code>.
         </div>
     </div>
     """, unsafe_allow_html=True)
 
     datasets = list_registered_datasets()
+    builtin_ids = {"regional_revenue", "customer_metrics", "product_performance", "cost_breakdown", "weekly_kpis"}
 
+    # ── Built-in datasets ──────────────────────────────────────────────────────
     st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='pi-panel-title'>Registered Datasets</div>", unsafe_allow_html=True)
-    registry_rows = [
-        {
-            "Dataset ID": item["dataset_id"],
-            "Display Name": item["display_name"],
-            "Category": item["category"],
-            "File": item["file"],
-            "Available": "Yes" if item["exists"] else "No",
-            "Use Cases": ", ".join(item["primary_use_cases"]),
-        }
-        for item in datasets
-    ]
-    st.dataframe(pd.DataFrame(registry_rows), use_container_width=True, hide_index=True)
+    st.markdown("<div class='pi-panel-title'>Built-in Demo Datasets</div>", unsafe_allow_html=True)
+    st.markdown("<div class='pi-panel-subtitle'>Synthetic NatWest banking datasets — ready to query.</div>", unsafe_allow_html=True)
+
+    builtin_datasets = [d for d in datasets if d["dataset_id"] in builtin_ids]
+    for item in builtin_datasets:
+        col_info, col_btn = st.columns([5, 1])
+        with col_info:
+            uc_list = ", ".join(item["primary_use_cases"])
+            status_color = "#166534" if item["exists"] else "#991b1b"
+            status_text  = "Available" if item["exists"] else "File missing"
+            st.markdown(f"""
+            <div style="padding:8px 0; border-bottom:1px solid #ebebed;">
+                <span style="font-size:13px; font-weight:700; color:#42145f;">{item['display_name']}</span>
+                <span style="font-size:11px; color:#9a9aaa; margin-left:8px;">{item['description']}</span>
+                <br>
+                <span style="font-size:10px; color:#6b3fa0; text-transform:uppercase; letter-spacing:0.08em;">
+                    {uc_list}
+                </span>
+                <span style="font-size:10px; color:{status_color}; margin-left:10px; font-weight:600;">
+                    {status_text}
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_btn:
+            if st.button("Query", key=f"reg_query_{item['dataset_id']}", use_container_width=True):
+                first_uc = item.get("primary_use_cases", ["summarize"])[0]
+                prefill = {
+                    "change_analysis": f"Why did a metric change in {item['display_name']}?",
+                    "compare":         f"Compare categories in {item['display_name']}",
+                    "breakdown":       f"Show breakdown of {item['display_name']} data",
+                    "summarize":       f"Give me a summary of {item['display_name']}",
+                }.get(first_uc, f"Show insights from {item['display_name']}")
+                st.session_state["auto_query"] = prefill
+                st.session_state["page"] = "Analyse"
+                st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # ── Custom datasets ────────────────────────────────────────────────────────
+    custom_datasets = [d for d in datasets if d["dataset_id"] not in builtin_ids]
+    if custom_datasets:
+        st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
+        st.markdown("<div class='pi-panel-title'>Your Registered Datasets</div>", unsafe_allow_html=True)
+        st.markdown("<div class='pi-panel-subtitle'>Datasets you have added — queryable with all 4 use case features.</div>", unsafe_allow_html=True)
+
+        for item in custom_datasets:
+            col_info, col_exp, col_qry = st.columns([5, 0.8, 0.8])
+            with col_info:
+                uc_list = ", ".join(item["primary_use_cases"])
+                status_color = "#166534" if item["exists"] else "#991b1b"
+                status_text  = "Available" if item["exists"] else "File missing"
+                st.markdown(f"""
+                <div style="padding:8px 0; border-bottom:1px solid #ebebed;">
+                    <span style="font-size:13px; font-weight:700; color:#42145f;">{item['display_name']}</span>
+                    <span style="font-size:11px; color:#9a9aaa; margin-left:8px;">{item['description']}</span>
+                    <br>
+                    <span style="font-size:10px; color:#6b3fa0; text-transform:uppercase; letter-spacing:0.08em;">
+                        {uc_list}
+                    </span>
+                    <span style="font-size:10px; color:{status_color}; margin-left:10px; font-weight:600;">
+                        {status_text}
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
+            with col_exp:
+                if st.button("Explore", key=f"reg_explore_{item['dataset_id']}", use_container_width=True):
+                    st.session_state["page"] = "Available Data"
+                    st.rerun()
+            with col_qry:
+                if st.button("Query", key=f"reg_cquery_{item['dataset_id']}", use_container_width=True):
+                    first_uc = item.get("primary_use_cases", ["summarize"])[0]
+                    prefill = {
+                        "change_analysis": f"What changed in {item['display_name']}?",
+                        "compare":         f"Compare categories in {item['display_name']}",
+                        "breakdown":       f"Show breakdown of {item['display_name']} data",
+                        "summarize":       f"Give me a summary of {item['display_name']}",
+                    }.get(first_uc, f"Show insights from {item['display_name']}")
+                    st.session_state["auto_query"] = prefill
+                    st.session_state["page"] = "Analyse"
+                    st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Add new dataset ────────────────────────────────────────────────────────
     st.markdown("<div class='pi-card'>", unsafe_allow_html=True)
     st.markdown("<div class='pi-panel-title'>Add Dataset</div>", unsafe_allow_html=True)
     st.markdown("<div class='pi-panel-subtitle'>Upload a CSV, register it centrally, and make it available to the explorer and AI query pipeline.</div>", unsafe_allow_html=True)
@@ -1615,8 +1980,30 @@ def page_dataset_registry():
                 file_name=safe_file_name,
                 primary_use_cases=use_cases,
             )
-            st.success(f"Dataset '{display_name.strip()}' has been added to the registry.")
-            st.rerun()
+            # Register the new view in the live pipeline (if loaded) so it's
+            # immediately queryable without a full page reload.
+            pipeline = load_pipeline()
+            if pipeline and "engine" in pipeline:
+                pipeline["engine"].register_new_dataset(dataset_id, file_path)
+
+            st.session_state["newly_registered"] = {
+                "id": dataset_id,
+                "display_name": display_name.strip(),
+                "use_cases": use_cases,
+            }
+            st.success(
+                f"Dataset '{display_name.strip()}' registered and loaded. "
+                f"Go to the Analyse tab to start querying it."
+            )
+            col_a, col_b, _ = st.columns([1, 1, 3])
+            with col_a:
+                if st.button("Go to Analyse", type="primary"):
+                    st.session_state["page"] = "Analyse"
+                    st.rerun()
+            with col_b:
+                if st.button("Explore dataset"):
+                    st.session_state["page"] = "Available Data"
+                    st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -1630,27 +2017,19 @@ def main():
     init_session()
     pipeline = load_pipeline()
 
-    # Handle sidebar navigation + demo triggers
-    demo_triggered = render_sidebar(pipeline)
-    if demo_triggered:
-        st.session_state["auto_query"] = demo_triggered
-        st.session_state["page"] = "Analyse"
-        st.rerun()
-
-    # Navbar
+    render_sidebar(pipeline)
     render_navbar()
 
-    # Page routing
-    page = st.session_state.get("page", "Analyse")
+    page = st.session_state.get("page", "How It Works")
 
-    if page == "Analyse":
-        page_analyse(pipeline)
-    elif page == "How It Works":
+    if page == "How It Works":
         page_how_it_works()
-    elif page == "Data Explorer":
+    elif page == "Available Data":
         page_data_explorer()
     elif page == "Dataset Registry":
         page_dataset_registry()
+    elif page == "Analyse":
+        page_analyse(pipeline)
 
 
 if __name__ == "__main__":

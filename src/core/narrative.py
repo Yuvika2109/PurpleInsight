@@ -199,7 +199,7 @@ class Narrative:
             }
 
         top_row = data[0]
-        dims = [key for key, value in top_row.items() if not isinstance(value, (int, float, float))]
+        dims = [key for key, value in top_row.items() if not isinstance(value, (int, float))]
         metrics = [key for key, value in top_row.items() if isinstance(value, (int, float))]
 
         lead_dim = dims[0] if dims else None

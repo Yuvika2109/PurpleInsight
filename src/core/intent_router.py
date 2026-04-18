@@ -175,8 +175,8 @@ class IntentRouter:
         best = max(scores.items(), key=lambda x: x[1][0])
         use_case_str, (count, matched_kws) = best
 
-        # Confidence: 0.6 base + 0.1 per additional keyword match (max 0.95)
-        confidence = min(0.6 + (count - 1) * 0.1, 0.95)
+        # Confidence: 0.82 base + 0.06 per additional keyword match (max 0.96)
+        confidence = min(0.82 + (count - 1) * 0.06, 0.96)
 
         return UseCase(use_case_str), confidence, matched_kws
 
@@ -205,7 +205,9 @@ class IntentRouter:
                 best_score    = max_sim
                 best_use_case = use_case
 
-        return best_use_case, best_score
+        # Scale cosine similarity to a more useful confidence range (0.65–0.95)
+        scaled = min(0.95, 0.65 + best_score * 0.45) if best_score > 0 else best_score
+        return best_use_case, scaled
 
     def classify(self, query: str) -> IntentResult:
         """
