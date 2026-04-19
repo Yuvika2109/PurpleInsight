@@ -1171,34 +1171,34 @@ def render_result(entry: dict):
 
 _DATASET_DEMOS = {
     "regional_revenue": [
-        ("Revenue drop", "Why did revenue drop in the South region last month?"),
-        ("Compare regions", "Compare North vs South region revenue for 2024"),
-        ("Revenue breakdown", "Show breakdown of revenue by product for 2024"),
-        ("Channel growth", "Which channel drove the most revenue growth in 2024?"),
+        ("Compare regions", "Compare total revenue across all regions last year"),
+        ("Revenue breakdown", "Show the breakdown of revenue by product"),
+        ("Revenue trend", "Show how revenue changed month by month"),
+        ("Top region", "Which region has the highest revenue"),
     ],
     "customer_metrics": [
-        ("Churn drivers", "What caused customer churn to rise in Q3 2024?"),
-        ("NPS by region", "Compare NPS scores across regions for 2024"),
-        ("Signup trends", "Show monthly new signup trends by customer segment"),
-        ("Complaint spike", "What drove the increase in customer complaints?"),
+        ("NPS by region", "Compare NPS scores across all regions"),
+        ("Signup trend", "Show new signup trends over time"),
+        ("Churn compare", "Compare churn rate across customer segments"),
+        ("Complaints", "Show breakdown of complaints by region"),
     ],
     "product_performance": [
-        ("Product compare", "Compare Personal Current Account vs Credit Card performance"),
-        ("Return rates", "Which product has the highest return rate?"),
-        ("Revenue by product", "Show breakdown of revenue by product"),
-        ("Satisfaction trend", "What is the trend in product satisfaction scores?"),
+        ("Volume compare", "Compare transaction volume across all products"),
+        ("Revenue breakdown", "Show breakdown of revenue by product"),
+        ("Top product", "Which product has the highest satisfaction score"),
+        ("Return rates", "Show return rate by product"),
     ],
     "cost_breakdown": [
         ("Cost by dept", "Show the breakdown of costs by department"),
-        ("Over budget", "Which departments are over budget in 2024?"),
-        ("Dept comparison", "Compare Technology vs Operations costs"),
-        ("Cost change", "What drove the increase in total costs in 2024?"),
+        ("Dept compare", "Compare total costs across all departments"),
+        ("By category", "Show cost breakdown by cost category"),
+        ("Highest cost", "Which department has the highest costs"),
     ],
     "weekly_kpis": [
-        ("Weekly summary", "Give me a weekly summary of customer metrics"),
-        ("NPS trends", "Show the trend in NPS score over the last 8 weeks"),
-        ("Digital adoption", "What is the trend in digital adoption rate?"),
-        ("Churn digest", "Give me a digest of churn and signup metrics"),
+        ("Signup trend", "Show how new signups and churn have changed week by week"),
+        ("KPI summary", "Give me a summary of weekly KPI trends"),
+        ("NPS trend", "Show the trend in NPS score over time"),
+        ("Digital adoption", "Show digital adoption rate trend"),
     ],
 }
 
